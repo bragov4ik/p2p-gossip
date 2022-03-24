@@ -8,6 +8,9 @@
 //! Channels handles can be obtained from [self::ChannelManager] using function `add_connection`.
 //! Then they can be passed to some asynchronous job that will talk to the remote host through them.
 //! 
+//! It logs problems when sending or receiving data with crate [log], to initialize logging you can
+//! use [crate::init_logging] or see [log] for others.
+//! 
 //! # Examples  
 //! 
 //! Two `ConnectionManager`s on 2 randomly-assigned ports connect two handlers to each other.
@@ -73,6 +76,11 @@ use tokio::{
     net::UdpSocket,
     sync::{ mpsc }
 };
+
+/// Initialize logging environment
+pub fn init_logging() {
+    simple_logger::SimpleLogger::new().init().unwrap();
+}
 
 /// `ChannelManager` allows to add new connections for its associated `ConnectionManager`.
 /// 
@@ -407,9 +415,93 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
+    use std::{net::SocketAddr, fmt::Debug};
+    use crate as udppm;
+    use udppm::{ ConnectionManager, ChannelManager, WriteChannel, ReadChannel, SendRequest };
+    use tokio::{time::{sleep, Duration}, sync::mpsc::error::TryRecvError::{Empty, Disconnected}};
+    use serde::{ Serialize, de::DeserializeOwned };
+
+
+    async fn handler<M>(
+        w_chan: WriteChannel<M>,
+        mut r_chan: ReadChannel<M>,
+        dest: SocketAddr,
+        msg: M,
+        period_sec: f64,
+        expect: M,
+    )
+    where
+        M: Serialize + DeserializeOwned + Clone + PartialEq + Debug
+    {
+        loop {
+            // Receive all pending messages
+            loop {
+                match r_chan.try_recv() {
+                    Ok(msg) => {
+                        println!("Received {:?}", msg);
+                        assert_eq!(expect, msg);
+                        return
+                    },
+                    Err(e) => {
+                        match e {
+                            Empty => {
+                                println!("Received none");
+                                break
+                            },
+                            Disconnected => return, };
+                    },
+                }
+            }
+            // Sleep for simplicity
+            sleep(Duration::from_secs_f64(period_sec)).await;
+            w_chan.send(SendRequest{ dest, payload: msg.clone() }).await.ok();
+        }
+    }
+    
+    async fn manager_test<M>(
+        con: ConnectionManager<M>,
+        chan: ChannelManager<M>,
+        remote_addr: SocketAddr,
+        msg: M,
+        period_sec: f64,
+        expect: M,
+    )
+    where
+        M: Serialize + DeserializeOwned + Clone + PartialEq + Debug
+    {
+        let addr = con.local_addr().unwrap();
+        let (w, r) = chan.add_connection(addr, 32).unwrap();
+        let fut = handler(w, r, remote_addr, msg, period_sec, expect);
+        let con_fut = con.run_buf::<508>();
+        let (_, res) = tokio::join!(fut, con_fut);
+        res.unwrap();
+    }
+    
+    async fn init_manager<M>() -> (ConnectionManager<M>, ChannelManager<M>)
+    where
+        M: Serialize + DeserializeOwned + Clone
+    {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (con, chan) = 
+            udppm::managers::<_, M>(addr, 32).await.unwrap();
+        return (con, chan)
+    }
+
+    #[tokio::test]
+    async fn two_pingers() {
+        udppm::init_logging();
+
+        let (con1, chan1) = init_manager().await;
+        let (con2, chan2) = init_manager().await;
+        let (addr1, addr2) = (con1.local_addr().unwrap(), con2.local_addr().unwrap());
+        println!("{}, {}", addr1, addr2);
+        tokio::join!(
+            manager_test(
+                con1, chan1, addr2, "A".to_string(), 2.0, "B".to_string()
+            ),
+            manager_test(
+                con2, chan2, addr1, "B".to_string(), 3.0, "A".to_string()
+            ),
+        );
     }
 }
