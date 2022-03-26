@@ -2,7 +2,7 @@ use std::{net::SocketAddr, fmt::Display, collections::HashMap, sync::{Arc, Mutex
 use serde::{Serialize, Deserialize};
 use tokio::{time::{Duration, Instant}, sync::{mpsc, watch}};
 
-use crate::connection;
+use crate::{connection, shutdown::ShutdownReceiver};
 use connection::{ Connection, Message };
 
 pub type Identity = u64;
@@ -23,7 +23,7 @@ impl Info {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Status {
+pub enum Status {
     Alive,
     Dead,
 }
@@ -32,8 +32,11 @@ enum Status {
 pub enum Error {
     ConnectionError(connection::Error),
     UnexpectedMessage(Message),
-    MutexPoisoned // gg
+    MutexPoisoned(MutexPoisoned),
 }
+
+#[derive(Debug)]
+pub struct MutexPoisoned {}
 
 pub type Shared<T> = Arc<Mutex<T>>;
 
@@ -48,6 +51,13 @@ pub struct Peer {
     // Info about this peer, shared
     info: Shared<Info>,
 
+    // TODO remove
+    // shutdown_receiver: ShutdownReceiver,
+
+    // In case this Peer (by identity) was found on different address, the address to be sent
+    // here to try to reconnect there
+    new_addresses: mpsc::Receiver<SocketAddr>,
+
     // All known peers in the network
     peers_info: Shared<HashMap<Identity, Shared<Info>>>,
 }
@@ -60,26 +70,36 @@ pub struct Config {
 }
 
 impl Peer {
-
-    // Produces Peer and channel for shutting it down
-    pub async fn new(
+    pub fn new(
         peers_info: Shared<HashMap<Identity, Shared<Info>>>,
         config: Config,
         conn: Connection,
         addr: SocketAddr,
         id: Identity,
-    ) -> Result<(Self, mpsc::Sender<()>), Error> {
+    ) -> Result<Self, Error> {
+        let (_, stub) = mpsc::channel(1);
+        Self::new_with_address_update(peers_info, config, conn, addr, id, stub)
+    }
+
+    // Produces Peer with associated channel for shutting it down
+    pub fn new_with_address_update(
+        peers_info: Shared<HashMap<Identity, Shared<Info>>>,
+        config: Config,
+        conn: Connection,
+        addr: SocketAddr,
+        id: Identity,
+        new_addresses: mpsc::Receiver<SocketAddr>,
+    ) -> Result<Self, Error> {
         let other_info = Arc::new(Mutex::new(Info::new(id, addr)));
-        let (shutdown_sender, shutdown_receiver) = mpsc::channel::<()>(1);
         let peer = Peer {
             conn,
             config,
             heartbeat_last_received: Instant::now(),
             info: other_info,
-            shutdown_receiver,
+            new_addresses,
             peers_info
         };
-        Ok((peer, shutdown_sender))
+        Ok(peer)
     }
 
     // Handle communication with a particular peer
@@ -121,7 +141,7 @@ impl Peer {
                         }
                     },
                     Error::UnexpectedMessage(_) => todo!(),
-                    Error::MutexPoisoned => {
+                    Error::MutexPoisoned(_) => {
                         log::error!("Some mutex was poisoned, can't function without it");
                         return;
                     },
@@ -150,27 +170,30 @@ impl Peer {
 
     async fn check_heartbeat(&mut self) -> Result<(), Error> {
         let elapsed = self.heartbeat_last_received.elapsed();
-        let mut info = self.info.lock()
-            .map_err(|_| {Error::MutexPoisoned})?;
         if elapsed > self.config.hb_timeout {
             // Dead
-            info.status = Status::Dead;
+            self.update_status(Status::Dead)
+                .map_err(Error::MutexPoisoned)?;
         }
         else {
             // Alive
+            let info = self.get_info_copy()
+                .map_err(Error::MutexPoisoned)?;
             if info.status == Status::Dead {
                 // Peer transitions from Dead to Alive state, so we ask it for new entries
                 // in case the network was split
                 self.conn.send_message(Message::ListPeersRequest).await
                     .map_err(Error::ConnectionError)?;
+                self.update_status(Status::Alive)
+                    .map_err(Error::MutexPoisoned)?;
             }
         }
         Ok(())
     }
 
-    fn list_peers(&mut self) -> Result<Vec<(Identity, SocketAddr)>, Error>{
+    fn list_peers(&mut self) -> Result<Vec<(Identity, SocketAddr)>, MutexPoisoned>{
         let peers_info = self.peers_info.lock()
-            .map_err(|_| {Error::MutexPoisoned})?;
+            .map_err(|_| {MutexPoisoned{}})?;
         
         // Get pairs `(peer_id, address)` or return `MutexPoisoned` error if at least one
         // `Info` mutex was poisoned
@@ -178,29 +201,31 @@ impl Peer {
             .map(|(s, i)| {
                 i.lock()
                     .map(|i| {(s.to_owned(), i.last_address)})
-                    .map_err(|_| {Error::MutexPoisoned })
+                    .map_err(|_| {MutexPoisoned{}})
             })
-            .collect::<Result<Vec<(Identity, SocketAddr)>, Error>>()
+            .collect::<Result<Vec<(Identity, SocketAddr)>, MutexPoisoned>>()
     }
 
     async fn handle_message(&mut self, m: Message) -> Result<(), Error> {
         match m {
             Message::Ping => {
-                let mut info = self.info.lock()
-                    .map_err(|_| {Error::MutexPoisoned})?;
+                let info = self.get_info_copy()
+                    .map_err(Error::MutexPoisoned)?;
                 println!("{}/{} - {}", info.id, info.last_address, m);
             },
             Message::Heartbeat => {
                 self.heartbeat_last_received = Instant::now()
             },
             Message::ListPeersRequest => {
-                let map = self.list_peers()?.into_iter().collect();
+                let map = self.list_peers()
+                    .map_err(Error::MutexPoisoned)?
+                    .into_iter().collect();
                 self.conn.send_message(Message::ListPeersResponse(map)).await
                     .map_err(Error::ConnectionError)?;
             },
             Message::ListPeersResponse(map) => {
                 let mut peers_info = self.peers_info.lock()
-                    .map_err(|_| {Error::MutexPoisoned})?;
+                    .map_err(|_| {Error::MutexPoisoned(MutexPoisoned{})})?;
                 for (identity, addr) in map {
                     if !peers_info.contains_key(&identity) {
                         peers_info.insert(
@@ -214,6 +239,21 @@ impl Peer {
 
             Message::Error(s) => log::error!("Peer sent error: {}", s),
         };
+        Ok(())
+    }
+
+    // TODO avoid copying
+    // was made to isolate lock and not hold it across awaits
+    fn get_info_copy(&self) -> Result<Info, MutexPoisoned> {
+        let info = self.info.lock()
+            .map_err(|_| {MutexPoisoned{}})?;
+        Ok(info.clone())
+    }
+
+    fn update_status(&self, new_status: Status) -> Result<(), MutexPoisoned> {
+        let mut info = self.info.lock()
+            .map_err(|_| {MutexPoisoned{}})?;
+        info.status = new_status;
         Ok(())
     }
 }
