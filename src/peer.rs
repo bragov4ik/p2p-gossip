@@ -1,8 +1,7 @@
-use std::{net::SocketAddr, fmt::Display, collections::HashMap, sync::{Arc, Mutex}};
-use serde::{Serialize, Deserialize};
-use tokio::{time::{Duration, Instant}, sync::{mpsc, watch}};
+use std::{net::SocketAddr, collections::HashMap, sync::{Arc, Mutex}};
+use tokio::{time::{Duration, Instant}, sync::mpsc};
 
-use crate::{connection, shutdown::ShutdownReceiver};
+use crate::connection;
 use connection::{ Connection, Message };
 
 pub type Identity = u64;
@@ -41,6 +40,7 @@ pub struct MutexPoisoned {}
 pub type Shared<T> = Arc<Mutex<T>>;
 
 // TODO add timeouts where applicable
+#[derive(Debug)]
 pub struct Peer {
     conn: Connection,
     config: Config,
@@ -51,9 +51,6 @@ pub struct Peer {
     // Info about this peer, shared
     info: Shared<Info>,
 
-    // TODO remove
-    // shutdown_receiver: ShutdownReceiver,
-
     // In case this Peer (by identity) was found on different address, the address to be sent
     // here to try to reconnect there
     new_addresses: mpsc::Receiver<SocketAddr>,
@@ -62,7 +59,7 @@ pub struct Peer {
     peers_info: Shared<HashMap<Identity, Shared<Info>>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Config {
     ping_period: Duration,
     hb_period: Duration,
@@ -118,10 +115,12 @@ impl Peer {
                     }
                 }
                 _ = ping_interval.tick() => {
-                    self.ping().await
+                    self.conn.send_message(Message::Ping).await
+                        .map_err(Error::ConnectionError)
                 }
                 _ = hb_send_interval.tick() => {
-                    self.send_heartbeat().await
+                    self.conn.send_message(Message::Heartbeat).await
+                        .map_err(Error::ConnectionError)
                 }
                 _ = hb_recv_interval.tick() => {
                     self.check_heartbeat().await
@@ -148,24 +147,6 @@ impl Peer {
                 }
             }
         }
-    }
-
-    pub fn info(&self) -> Shared<Info> {
-        self.info.clone()
-    }
-
-    // TODO: make some periodic msg class to unify these 2
-
-    async fn ping(&mut self) -> Result<(), Error> {
-        self.conn.send_message(Message::Ping).await
-            .map_err(Error::ConnectionError)?;
-        Ok(())
-    }
-
-    async fn send_heartbeat(&mut self) -> Result<(), Error> {
-        self.conn.send_message(Message::Heartbeat).await
-            .map_err(Error::ConnectionError)?;
-        Ok(())
     }
 
     async fn check_heartbeat(&mut self) -> Result<(), Error> {

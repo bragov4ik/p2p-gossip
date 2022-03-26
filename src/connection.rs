@@ -47,6 +47,7 @@ pub enum Error {
     StreamEnded,
 }
 
+#[derive(Debug)]
 pub struct Connection {
     // stream: TcpStream,
     framed_stream: Framed<TcpStream, BytesCodec>,
@@ -61,7 +62,6 @@ impl Connection {
         Ok(Connection{framed_stream})
     }
 
-    // addr - address of the remote's listener port
     pub fn from_stream(stream: TcpStream) -> Self {
         let framed_stream = BytesCodec::new().framed(stream);
         Connection{framed_stream}
@@ -75,6 +75,7 @@ impl Connection {
             .map_err(Error::IOError)?;
         Ok(())
     }
+    
     pub async fn recv_message(&mut self) -> Result<Message, Error> {
         let result = match self.framed_stream.next().await {
             Some(v) => v,

@@ -1,8 +1,8 @@
-use std::{collections::{HashMap, VecDeque}, sync::{Arc, Mutex}, net::SocketAddr};
+use std::{collections::HashMap, sync::{Arc, Mutex}, net::SocketAddr};
 
 use tokio::{sync::mpsc, net::{TcpListener, TcpStream}};
 
-use crate::{ peer, connection, shutdown::ShutdownSender };
+use crate::{ peer, connection };
 use connection::Connection;
 use peer::{ Peer, Shared };
 
@@ -29,8 +29,9 @@ impl AddressNotifier {
 
     pub async fn notify_new_address(
         &mut self, new_addr: SocketAddr
-    ) -> Result<(), mpsc::error::SendError<SocketAddr>> {
+    ) -> Result<(), Error> {
         self.new_address_sender.send(new_addr).await
+            .map_err(Error::MpscSendAddrError)
     }
 }
 
@@ -45,6 +46,8 @@ struct Network {
 #[derive(Debug)]
 pub enum Error {
     PeerError(peer::Error),
+    MpscSendAddrError(mpsc::error::SendError<SocketAddr>),
+    MpscSendPeerError(mpsc::error::SendError<Peer>)
 }
 
 impl Network {
@@ -106,40 +109,14 @@ impl Network {
         &mut self, stream: TcpStream, peer_config: peer::Config
     ) -> Result<(), Error> {
         let mut conn = Connection::from_stream(stream);
-        let add_me_req = self.initiate_peer(&mut conn, &peer_config).await?;
+        let add_me_req = self.initiate_peer(&mut conn).await?;
         self.add_to_network(add_me_req, peer_config, conn).await?;
-        Ok(())
-    }
-
-    // Based on the identity either notify Peer about new address or add new one
-    async fn add_to_network(
-        &mut self, id_addr: connection::AddMePayload, peer_config: peer::Config, conn: Connection
-    ) -> Result<(), Error> {
-        match self.notifiers.get_mut(&id_addr.identity) {
-            Some(notifier) => {
-                notifier.notify_new_address(id_addr.listen_addr).await;
-            },
-            None => {
-                let (peer, notifier) = AddressNotifier::peer_notifier(
-                    self.peers_info.clone(),
-                    peer_config,
-                    conn,
-                    id_addr.listen_addr,
-                    id_addr.identity,
-                ).map_err(Error::PeerError)?;
-                self.notifiers.insert(
-                    id_addr.identity,
-                    notifier
-                );
-                self.new_peers_sender.send(peer).await;
-            },
-        };
         Ok(())
     }
 
     // Get identity of the newcomer
     async fn initiate_peer(
-        &self, conn: &mut Connection, peer_config: &peer::Config
+        &self, conn: &mut Connection
     ) -> Result<connection::AddMePayload, Error> {
         // First message in the connection should be AddMe with info
         let m = conn.recv_message().await
@@ -156,5 +133,32 @@ impl Network {
                 .map_err(Error::PeerError)?;
             Err(Error::PeerError(peer::Error::UnexpectedMessage(m)))
         }
+    }
+
+    // Based on the identity either notify Peer about new address or add new one
+    async fn add_to_network(
+        &mut self, id_addr: connection::AddMePayload, peer_config: peer::Config, conn: Connection
+    ) -> Result<(), Error> {
+        match self.notifiers.get_mut(&id_addr.identity) {
+            Some(notifier) => {
+                notifier.notify_new_address(id_addr.listen_addr).await?;
+            },
+            None => {
+                let (peer, notifier) = AddressNotifier::peer_notifier(
+                    self.peers_info.clone(),
+                    peer_config,
+                    conn,
+                    id_addr.listen_addr,
+                    id_addr.identity,
+                ).map_err(Error::PeerError)?;
+                self.notifiers.insert(
+                    id_addr.identity,
+                    notifier
+                );
+                self.new_peers_sender.send(peer).await
+                    .map_err(Error::MpscSendPeerError)?;
+            },
+        };
+        Ok(())
     }
 }
