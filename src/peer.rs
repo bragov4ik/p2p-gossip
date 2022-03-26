@@ -9,15 +9,13 @@ pub type Identity = u64;
 #[derive(Debug, Clone)]
 pub struct Info {
     pub id: Identity,
-    pub last_activity: Instant,
     pub status: Status,
     pub last_address: SocketAddr,
 }
 
 impl Info {
     fn new(id: Identity, last_address: SocketAddr) -> Self {
-        // TODO see maybe other values
-        Info { id, last_activity: Instant::now(), status: Status::Alive, last_address }
+        Info { id, status: Status::Alive, last_address }
     }
 }
 
@@ -46,7 +44,7 @@ pub struct Peer {
     config: Config,
 
     // For receiving and checking
-    heartbeat_last_received: Instant,
+    last_active: Instant,
 
     // Info about this peer, shared
     info: Shared<Info>,
@@ -91,7 +89,7 @@ impl Peer {
         let peer = Peer {
             conn,
             config,
-            heartbeat_last_received: Instant::now(),
+            last_active: Instant::now(),
             info: other_info,
             new_addresses,
             peers_info
@@ -150,7 +148,7 @@ impl Peer {
     }
 
     async fn check_heartbeat(&mut self) -> Result<(), Error> {
-        let elapsed = self.heartbeat_last_received.elapsed();
+        let elapsed = self.last_active.elapsed();
         if elapsed > self.config.hb_timeout {
             // Dead
             self.update_status(Status::Dead)
@@ -194,9 +192,7 @@ impl Peer {
                     .map_err(Error::MutexPoisoned)?;
                 println!("{}/{} - {}", info.id, info.last_address, m);
             },
-            Message::Heartbeat => {
-                self.heartbeat_last_received = Instant::now()
-            },
+            Message::Heartbeat => (), // We update timer on each activity after match
             Message::ListPeersRequest => {
                 let map = self.list_peers()
                     .map_err(Error::MutexPoisoned)?
@@ -220,10 +216,10 @@ impl Peer {
 
             Message::Error(s) => log::error!("Peer sent error: {}", s),
         };
+        self.last_active = Instant::now();
         Ok(())
     }
 
-    // TODO avoid copying
     // was made to isolate lock and not hold it across awaits
     fn get_info_copy(&self) -> Result<Info, MutexPoisoned> {
         let info = self.info.lock()
@@ -231,6 +227,7 @@ impl Peer {
         Ok(info.clone())
     }
 
+    // same, lock isolation to avoid deadlock
     fn update_status(&self, new_status: Status) -> Result<(), MutexPoisoned> {
         let mut info = self.info.lock()
             .map_err(|_| {MutexPoisoned{}})?;
