@@ -1,5 +1,5 @@
 use std::{net::SocketAddr, collections::HashMap, sync::{Arc, Mutex}};
-use tokio::{time::{Duration, Instant}, sync::mpsc};
+use tokio::{time::{Duration, Instant}, sync::mpsc, io::{AsyncRead, AsyncWrite}};
 
 use crate::connection;
 use connection::{ Connection, Message };
@@ -39,8 +39,11 @@ pub type Shared<T> = Arc<Mutex<T>>;
 
 // TODO add timeouts where applicable
 #[derive(Debug)]
-pub struct Peer {
-    conn: Connection,
+pub struct Peer<T>
+where
+    T: AsyncRead + AsyncWrite + Sized + std::marker::Unpin
+{
+    conn: Connection<T>,
     config: Config,
 
     // For receiving and checking
@@ -64,11 +67,14 @@ pub struct Config {
     hb_timeout: Duration,
 }
 
-impl Peer {
+impl<T> Peer<T>
+where
+    T: AsyncRead + AsyncWrite + Sized  + std::marker::Unpin
+{
     pub fn new(
         peers_info: Shared<HashMap<Identity, Shared<Info>>>,
         config: Config,
-        conn: Connection,
+        conn: Connection<T>,
         addr: SocketAddr,
         id: Identity,
     ) -> Result<Self, Error> {
@@ -80,7 +86,7 @@ impl Peer {
     pub fn new_with_address_update(
         peers_info: Shared<HashMap<Identity, Shared<Info>>>,
         config: Config,
-        conn: Connection,
+        conn: Connection<T>,
         addr: SocketAddr,
         id: Identity,
         new_addresses: mpsc::Receiver<SocketAddr>,

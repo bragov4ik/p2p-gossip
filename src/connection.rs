@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, fmt::Display, collections::HashMap};
 use serde::{Serialize, Deserialize};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{BytesCodec, Framed, Decoder};
 use futures::{ sink::SinkExt, stream::StreamExt };
 use crate::peer;
@@ -48,21 +48,18 @@ pub enum Error {
 }
 
 #[derive(Debug)]
-pub struct Connection {
-    // stream: TcpStream,
-    framed_stream: Framed<TcpStream, BytesCodec>,
+pub struct Connection<T>
+where
+    T: AsyncRead + AsyncWrite + Sized + std::marker::Unpin
+{
+    framed_stream: Framed<T, BytesCodec>,
 }
 
-impl Connection {
-    pub async fn new(addr: SocketAddr) -> std::io::Result<Self> {
-        
-        let stream = TcpStream::connect(addr).await?;
-        // TODO add tls
-        let framed_stream = BytesCodec::new().framed(stream);
-        Ok(Connection{framed_stream})
-    }
-
-    pub fn from_stream(stream: TcpStream) -> Self {
+impl<T> Connection<T>
+where
+    T: AsyncRead + AsyncWrite + Sized + std::marker::Unpin
+{
+    pub fn from_stream(stream: T) -> Self {
         let framed_stream = BytesCodec::new().framed(stream);
         Connection{framed_stream}
     }
@@ -75,7 +72,7 @@ impl Connection {
             .map_err(Error::IOError)?;
         Ok(())
     }
-    
+
     pub async fn recv_message(&mut self) -> Result<Message, Error> {
         let result = match self.framed_stream.next().await {
             Some(v) => v,
@@ -86,5 +83,13 @@ impl Connection {
         let m = bincode::deserialize(bytes)
             .map_err(Error::SerializationError)?;
         Ok(m)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn aboba() {
+
     }
 }
