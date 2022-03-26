@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::{Arc, Mutex}, net::SocketAddr};
 
 use tokio::{sync::mpsc, net::{TcpListener, TcpStream}};
 
-use crate::{ peer, connection };
+use crate::{ peer, connection, shutdown::ShutdownSender };
 use connection::Connection;
 use peer::{ Peer, Shared };
 
@@ -10,6 +10,8 @@ use peer::{ Peer, Shared };
 #[derive(Clone)]
 struct PeerWrapper {
     peer: Shared<Peer>,
+    info: Shared<peer::Info>,
+    shutdown_handle: ShutdownSender,
 }
 
 struct WrapperPoisoned { }
@@ -20,8 +22,26 @@ enum WrapperTryLockError {
 }
 
 impl PeerWrapper {
-    pub fn new(peer: Peer) -> Self {
-        PeerWrapper { peer: Arc::new(Mutex::new(peer)) }
+    pub fn new(
+        peers_info: Shared<HashMap<peer::Identity, Shared<peer::Info>>>,
+        config: peer::Config,
+        conn: Connection,
+        addr: SocketAddr,
+        id: peer::Identity,
+    ) -> Result<Self, peer::Error> {
+        let shutdown = crate::shutdown::new_shutdown();
+        let peer = Peer::new_with_shutdown(
+            peers_info, config, conn, addr, id, shutdown.1
+        )?;
+        Ok(PeerWrapper {
+            peer: Arc::new(Mutex::new(peer)),
+            info: peer.info(),
+            shutdown_handle: shutdown.0
+        })
+    }
+
+    pub fn info(&self) -> Shared<peer::Info> {
+        self.info.clone()
     }
 
     pub fn is_running(&self) -> Result<bool, WrapperPoisoned> {
@@ -53,14 +73,17 @@ impl PeerWrapper {
         }
     }
 
-    pub async fn shutdown(&mut self) -> Result<(), WrapperPoisoned> {
-        todo!()
+    pub async fn shutdown(&mut self) {
+        self.shutdown_handle.send_shutdown().await;
+        self.shutdown_handle.wait_finish().await;
+        // Make sure `run` has freed Mutex just in case
+        self.peer.lock();
     }
 }
 
 struct Network {
     // These 2 Hash maps should be consistent
-    peers: HashMap<peer::Identity, Peer>,
+    peers: HashMap<peer::Identity, PeerWrapper>,
     peers_info: Shared<HashMap<peer::Identity, Shared<peer::Info>>>,
     new_peers_receiver: mpsc::Receiver<peer::Info>,
     new_peers_sender: mpsc::Sender<peer::Info>,
@@ -134,39 +157,38 @@ impl Network {
     }
 
     // Based on the identity either replace some Peer or add new one
-    async fn add_to_network(&mut self, peer: Peer) -> Result<(), Error> {
+    async fn add_to_network(&mut self, peer: PeerWrapper) -> Result<(), Error> {
         let info_mutex = peer.info();
-        let peer_info = info_mutex.lock()
-            .map_err(|_| {peer::Error::MutexPoisoned})
-            .map_err(Error::PeerError)?;
-        let peer_id = peer_info.id;
-        match self.peers.get(&peer_id) {
-            Some(old_handler) => {
-                // Stop assigned Peer and add new one instead
-                old_handler.
-            },
-            None => todo!(),
+        {
+            let peer_info = info_mutex.lock()
+                .map_err(|_| {peer::Error::MutexPoisoned})
+                .map_err(Error::PeerError)?;
+            let peer_id = peer_info.id;
         }
+        // TODO see if easier to reconnect to other address instead
+        if let Some(old_handler) = self.peers.get_mut(&peer_id) {
+            old_handler.shutdown().await
+        }
+        self.peers.insert(peer_id, peer);
         Ok(())
     }
 
     // Get identity and create Peer
     async fn initiate_peer(
         &self, mut conn: Connection, peer_config: peer::Config
-    ) -> Result<Peer, Error> {
+    ) -> Result<PeerWrapper, Error> {
         // First message in the connection should be AddMe with info
         let m = conn.recv_message().await
             .map_err(peer::Error::ConnectionError)
             .map_err(Error::PeerError)?;
         if let connection::Message::AddMe(info) = m {
-            Peer::new(
+            PeerWrapper::new(
                 self.peers_info.clone(),
                 peer_config,
                 conn,
                 info.listen_addr,
                 info.identity,
-            ).await
-                .map_err(Error::PeerError)
+            ).map_err(Error::PeerError)
         }
         else {
             conn.send_message(
