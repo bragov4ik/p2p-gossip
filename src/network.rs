@@ -1,59 +1,56 @@
 use std::{collections::HashMap, sync::{Arc, Mutex}, net::SocketAddr};
 
-use tokio::{sync::mpsc, net::{TcpListener, TcpStream}, io::{AsyncRead, AsyncWrite}};
+use tokio::{sync::mpsc, net::{TcpListener, TcpStream}};
 
 use crate::{
     peer::{self, Config, Identity, Info, Peer, Shared},
     connection::{self, LocalInfo, Connection}
 };
 
-struct AddressNotifier {
-    new_address_sender: mpsc::Sender<SocketAddr>,
+struct ConnectionNotifier {
+    new_address_sender: mpsc::Sender<(SocketAddr, Connection<TcpStream>)>,
 }
 
-impl AddressNotifier {
+impl ConnectionNotifier {
     /// Create peer with associated notifier
-    pub fn peer_notifier<T>(
+    pub fn peer_notifier(
         peers_info: Shared<HashMap<Identity, Shared<Info>>>,
         config: Config,
-        conn: Connection<T>,
+        conn: Connection<TcpStream>,
         addr: SocketAddr,
         id: Identity,
         self_info: Arc<connection::LocalInfo>,
-    ) -> Result<(Peer<T>, Self), peer::Error>
-    where
-        T: AsyncRead + AsyncWrite + Sized + std::marker::Unpin
-    {
+    ) -> Result<(Peer, Self), peer::Error> {
         // TODO config the number
         let (new_address_sender, new_address_receiver) = mpsc::channel(32);
-        let peer = Peer::new_with_address_update(
+        let peer = Peer::new_with_connection_update(
             peers_info, config, conn, addr, id, self_info, new_address_receiver
         )?;
-        Ok((peer, AddressNotifier{new_address_sender}))
+        Ok((peer, ConnectionNotifier{new_address_sender}))
     }
 
-    pub async fn notify_new_address(
-        &mut self, new_addr: SocketAddr
+    pub async fn notify_new_connection(
+        &mut self, listen_addr: SocketAddr, conn: Connection<TcpStream>,
     ) -> Result<(), Error> {
-        self.new_address_sender.send(new_addr).await
+        self.new_address_sender.send((listen_addr, conn)).await
             .map_err(Error::MpscSendAddrError)
     }
 }
 
 pub struct Network {
-    notifiers: HashMap<Identity, AddressNotifier>,
+    notifiers: HashMap<Identity, ConnectionNotifier>,
     peers_info: Shared<HashMap<Identity, Shared<Info>>>,
     self_info: Arc<connection::LocalInfo>,
     // New Peers handlers scheduled for run
-    new_peers_receiver: mpsc::Receiver<Peer<TcpStream>>,
-    new_peers_sender: mpsc::Sender<Peer<TcpStream>>,
+    new_peers_receiver: mpsc::Receiver<Peer>,
+    new_peers_sender: mpsc::Sender<Peer>,
 }
 
 #[derive(Debug)]
 pub enum Error {
     PeerError(peer::Error),
-    MpscSendAddrError(mpsc::error::SendError<SocketAddr>),
-    MpscSendPeerError(mpsc::error::SendError<Peer<TcpStream>>)
+    MpscSendAddrError(mpsc::error::SendError<(SocketAddr, Connection<TcpStream>)>),
+    MpscSendPeerError(mpsc::error::SendError<Peer>)
 }
 
 impl Network {
@@ -160,10 +157,10 @@ impl Network {
     ) -> Result<(), Error> {
         match self.notifiers.get_mut(&id_addr.identity) {
             Some(notifier) => {
-                notifier.notify_new_address(id_addr.listen_addr).await?;
+                notifier.notify_new_connection(id_addr.listen_addr, conn).await?;
             },
             None => {
-                let (peer, notifier) = AddressNotifier::peer_notifier(
+                let (peer, notifier) = ConnectionNotifier::peer_notifier(
                     self.peers_info.clone(),
                     peer_config,
                     conn,

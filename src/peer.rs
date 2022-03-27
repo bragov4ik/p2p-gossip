@@ -1,5 +1,5 @@
 use std::{net::SocketAddr, collections::HashMap, sync::{Arc, Mutex}};
-use tokio::{time::{Duration, Instant}, sync::mpsc, io::{AsyncRead, AsyncWrite}};
+use tokio::{time::{Duration, Instant}, sync::mpsc, net::TcpStream};
 
 use crate::connection;
 use connection::{ Connection, Message };
@@ -39,11 +39,9 @@ pub type Shared<T> = Arc<Mutex<T>>;
 
 // TODO add timeouts where applicable
 #[derive(Debug)]
-pub struct Peer<T>
-where
-    T: AsyncRead + AsyncWrite + Sized + std::marker::Unpin
+pub struct Peer
 {
-    conn: Connection<T>,
+    conn: Connection<TcpStream>,
     config: Config,
 
     // For receiving and checking
@@ -57,7 +55,7 @@ where
 
     // In case handled Peer (by identity) was found on different address, the address to be sent
     // here to try to reconnect there
-    new_addresses: mpsc::Receiver<SocketAddr>,
+    new_connections: mpsc::Receiver<(SocketAddr, Connection<TcpStream>)>,
 
     // All known peers in the network (except local one)
     peers_info: Shared<HashMap<Identity, Shared<Info>>>,
@@ -70,31 +68,28 @@ pub struct Config {
     pub hb_timeout: Duration,
 }
 
-impl<T> Peer<T>
-where
-    T: AsyncRead + AsyncWrite + Sized  + std::marker::Unpin
-{
+impl Peer {
     pub fn new(
         peers_info: Shared<HashMap<Identity, Shared<Info>>>,
         config: Config,
-        conn: Connection<T>,
+        conn: Connection<TcpStream>,
         addr: SocketAddr,
         id: Identity,
         self_info: Arc<connection::LocalInfo>,
     ) -> Result<Self, Error> {
         let (_, stub) = mpsc::channel(1);
-        Self::new_with_address_update(peers_info, config, conn, addr, id, self_info, stub)
+        Self::new_with_connection_update(peers_info, config, conn, addr, id, self_info, stub)
     }
 
     // Produces Peer with associated channel for shutting it down
-    pub fn new_with_address_update(
+    pub fn new_with_connection_update(
         peers_info: Shared<HashMap<Identity, Shared<Info>>>,
         config: Config,
-        conn: Connection<T>,
+        conn: Connection<TcpStream>,
         addr: SocketAddr,
         id: Identity,
         self_info: Arc<connection::LocalInfo>,
-        new_addresses: mpsc::Receiver<SocketAddr>,
+        new_connections: mpsc::Receiver<(SocketAddr, Connection<TcpStream>)>,
     ) -> Result<Self, Error> {
         let other_info = Arc::new(Mutex::new(Info::new(id, addr)));
         let peer = Peer {
@@ -103,7 +98,7 @@ where
             last_active: Instant::now(),
             info: other_info,
             self_info,
-            new_addresses,
+            new_connections,
             peers_info
         };
         Ok(peer)
@@ -112,60 +107,66 @@ where
     // Handle communication with a particular peer
     pub async fn handle_peer(&mut self) -> Result<(), Error>{
         use tokio::time::interval;
-        // First we need to introduce ourselves
-        self.conn.send_message(
-            Message::Authenticate((*self.self_info).clone())).await
-                .map_err(Error::ConnectionError)?;
 
         let mut ping_interval = interval(self.config.ping_period);
         let mut hb_send_interval = interval(self.config.hb_period);
         let mut hb_recv_interval = interval(self.config.hb_timeout);
+
         loop {
-            let recv = self.conn.recv_message();
-            let res = tokio::select! {
-                recv_res = recv => {
-                    match recv_res {
-                        Ok(m) => self.handle_message(m).await,
-                        Err(e) => Err(Error::ConnectionError(e)),
-                    }
-                }
-                _ = ping_interval.tick() => {
-                    self.conn.send_message(Message::Ping).await
-                        .map_err(Error::ConnectionError)
-                }
-                _ = hb_send_interval.tick() => {
-                    self.conn.send_message(Message::Heartbeat).await
-                        .map_err(Error::ConnectionError)
-                }
-                _ = hb_recv_interval.tick() => {
-                    self.check_heartbeat().await
-                }
-            };
-            if let Err(e) = res {
-                match &e {
-                    Error::ConnectionError(conn_e) => {
-                        match conn_e {
-                            connection::Error::SerializationError(e) => 
-                                log::warn!("{}", e),
-                            connection::Error::IOError(e) => log::warn!("{}", e),
-                            connection::Error::StreamEnded => {
-                                log::error!("Connection closed"); // TODO: try to reconnect
-                                return Err(e);
-                            },
+
+            // TODO reconnect
+            // self.conn.send_message(
+            //     Message::Authenticate((*self.self_info).clone())).await
+            //         .map_err(Error::ConnectionError)?;
+            loop {
+                let recv = self.conn.recv_message();
+                let res = tokio::select! {
+                    recv_res = recv => {
+                        match recv_res {
+                            Ok(m) => self.handle_message(m).await,
+                            Err(e) => Err(Error::ConnectionError(e)),
                         }
-                    },
-                    Error::UnexpectedMessage(_) => todo!(),
-                    Error::MutexPoisoned(_) => {
-                        log::error!("Some mutex was poisoned, can't function without it");
-                        return Err(e);
-                    },
+                    }
+                    _ = ping_interval.tick() => {
+                        self.conn.send_message(Message::Ping).await
+                            .map_err(Error::ConnectionError)
+                    }
+                    _ = hb_send_interval.tick() => {
+                        self.conn.send_message(Message::Heartbeat).await
+                            .map_err(Error::ConnectionError)
+                    }
+                    _ = hb_recv_interval.tick() => {
+                        self.check_heartbeat().await
+                    }
+                };
+                if let Err(e) = res {
+                    match &e {
+                        Error::ConnectionError(conn_e) => {
+                            match conn_e {
+                                connection::Error::SerializationError(e) => 
+                                    log::warn!("{}", e),
+                                connection::Error::IOError(e) => log::warn!("{}", e),
+                                connection::Error::StreamEnded => {
+                                    log::error!("Connection closed");
+                                    break;
+                                },
+                            }
+                        },
+                        Error::UnexpectedMessage(_) => todo!(),
+                        Error::MutexPoisoned(_) => {
+                            log::error!("Some mutex was poisoned, can't function without it");
+                            return Err(e);
+                        },
+                    }
                 }
             }
         }
     }
 
     async fn reconnect(&self) -> Result<(), Error> {
-        
+        loop {
+            // TcpStream
+        }
     }
 
     async fn handle_message(&mut self, m: Message) -> Result<(), Error> {
