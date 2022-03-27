@@ -9,7 +9,9 @@ mod network;
 #[derive(Parser)]
 #[clap(author, version, about)]
 struct Args {
+    #[clap(long, default_value="5")]
     period: u64,
+    #[clap(long, default_value="8080")]
     port: u16,
     connect: Option<SocketAddr>,
 }
