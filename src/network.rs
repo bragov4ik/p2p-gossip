@@ -4,7 +4,7 @@ use tokio::{sync::mpsc, net::{TcpListener, TcpStream}, io::{AsyncRead, AsyncWrit
 
 use crate::{
     peer::{self, Config, Identity, Info, Peer, Shared},
-    connection::{self, AddMePayload, Connection}
+    connection::{self, LocalInfo, Connection}
 };
 
 struct AddressNotifier {
@@ -19,6 +19,7 @@ impl AddressNotifier {
         conn: Connection<T>,
         addr: SocketAddr,
         id: Identity,
+        self_info: Arc<connection::LocalInfo>,
     ) -> Result<(Peer<T>, Self), peer::Error>
     where
         T: AsyncRead + AsyncWrite + Sized + std::marker::Unpin
@@ -26,7 +27,7 @@ impl AddressNotifier {
         // TODO config the number
         let (new_address_sender, new_address_receiver) = mpsc::channel(32);
         let peer = Peer::new_with_address_update(
-            peers_info, config, conn, addr, id, new_address_receiver
+            peers_info, config, conn, addr, id, self_info, new_address_receiver
         )?;
         Ok((peer, AddressNotifier{new_address_sender}))
     }
@@ -39,9 +40,10 @@ impl AddressNotifier {
     }
 }
 
-struct Network {
+pub struct Network {
     notifiers: HashMap<Identity, AddressNotifier>,
     peers_info: Shared<HashMap<Identity, Shared<Info>>>,
+    self_info: Arc<connection::LocalInfo>,
     // New Peers handlers scheduled for run
     new_peers_receiver: mpsc::Receiver<Peer<TcpStream>>,
     new_peers_sender: mpsc::Sender<Peer<TcpStream>>,
@@ -55,18 +57,22 @@ pub enum Error {
 }
 
 impl Network {
-    pub async fn new() -> Self {
+    pub fn new(identity: Identity, listen_addr: SocketAddr) -> Self {
         let peers_info = Arc::new(Mutex::new(HashMap::new()));
         let peers = HashMap::new();
         // TODO config the number
         let (new_peers_sender, new_peers_receiver) = mpsc::channel(64);
-        Network{peers_info, notifiers: peers, new_peers_receiver, new_peers_sender}
+        let self_info = Arc::new(connection::LocalInfo {
+            identity,
+            listen_addr,
+        });
+        Network{notifiers: peers, peers_info, self_info, new_peers_receiver, new_peers_sender}
     }
 
     pub async fn start(
-        mut self, peer_config: Config, listen_addr: SocketAddr
+        mut self, peer_config: Config 
     ) -> std::io::Result<()> {
-        let listener = TcpListener::bind(listen_addr).await?;
+        let listener = TcpListener::bind(self.self_info.listen_addr).await?;
         loop {
             let new_peer = self.new_peers_receiver.recv();
             tokio::select! {
@@ -109,6 +115,12 @@ impl Network {
         }
     }
 
+    // pub async fn start_connect(
+    //     mut self, peer_config: Config, listen_addr: SocketAddr, connect_addr: SocketAddr
+    // ) -> std::io::Result<()> {
+
+    // }
+
     async fn manage_new_con(
         &mut self, stream: TcpStream, peer_config: Config
     ) -> Result<(), Error> {
@@ -121,12 +133,12 @@ impl Network {
     // Get identity of the newcomer
     async fn initiate_peer(
         &self, conn: &mut Connection<TcpStream>
-    ) -> Result<AddMePayload, Error> {
+    ) -> Result<LocalInfo, Error> {
         // First message in the connection should be AddMe with info
         let m = conn.recv_message().await
             .map_err(peer::Error::ConnectionError)
             .map_err(Error::PeerError)?;
-        if let connection::Message::AddMe(info) = m {
+        if let connection::Message::Authenticate(info) = m {
             Ok(info)
         }
         else {
@@ -142,7 +154,7 @@ impl Network {
     // Based on the identity either notify Peer about new address or add new one
     async fn add_to_network(
         &mut self,
-        id_addr: AddMePayload,
+        id_addr: LocalInfo,
         peer_config: Config,
         conn: Connection<TcpStream>
     ) -> Result<(), Error> {
@@ -157,6 +169,7 @@ impl Network {
                     conn,
                     id_addr.listen_addr,
                     id_addr.identity,
+                    self.self_info.clone(),
                 ).map_err(Error::PeerError)?;
                 self.notifiers.insert(
                     id_addr.identity,
