@@ -181,6 +181,10 @@ impl Network {
         conn_opt: Option<Connection<TcpStream>>
     ) -> Result<(), Error> {
         tracing::debug!("Adding peer (auth {:?}, connection {:?}) to network", peer_id, conn_opt);
+        if peer_id == self.self_id {
+            tracing::debug!("Trying to add myself to the network, aborting");
+            return Ok(());
+        }
         if self.notifiers.contains_key(&peer_id) {
             tracing::debug!("Peer {} is already known", peer_id);
             if let Some(conn) = conn_opt {

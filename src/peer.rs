@@ -354,8 +354,7 @@ impl Peer {
                 let known_peers = self.known_peers()
                     .map_err(Error::MutexPoisoned)?;
                 for (auth, peer_listen_addr) in map {
-                    if !known_peers.contains(&auth) {
-                    // if !known_peers.contains(&auth) && auth != *self.self_id { TODO use this
+                    if !known_peers.contains(&auth) && auth != *self.self_id {
                         if let Err(_) = self.new_auth_addr.send(
                             (Arc::new(auth), peer_listen_addr)
                         ).await {
