@@ -128,8 +128,20 @@ impl Peer {
         let mut hb_recv_interval = interval(self.config.hb_timeout);
 
         tracing::debug!("Start handling a peer {}", *self.peer_id);
-
         loop {
+            if let Some(conn) = &mut conn_opt {
+                tracing::debug!("Asking for list of peers after reconnect, if any");
+                if let Ok(peer_listen_addr) = self.get_listen_addr() {
+                    tracing::info!("Connected to {}/{}", self.peer_id, peer_listen_addr);
+                }
+                else {
+                    tracing::error!("Mutex peer_info poisoned, unable to proceed");
+                    return Err(Error::MutexPoisoned(MutexPoisoned{}))
+                }
+                if let Err(e) = conn.send_message(Message::ListPeersRequest).await {
+                    tracing::warn!("Couldn't send list peers request: {:?}", e);
+                }
+            }
             loop {
                 let conn = match &mut conn_opt {
                     Some(c) => c,
@@ -192,7 +204,7 @@ impl Peer {
                 ).await;
                 match res {
                     Ok((conn, new_listen)) => {
-                        tracing::info!("Reconnected successfully, continuing operation");
+                        tracing::debug!("(Re)connected to {}/{}", self.peer_id, new_listen);
                         conn_opt = Some(conn);
                         self.update_listen_addr(new_listen)
                             .map_err(Error::MutexPoisoned)?;
@@ -343,6 +355,7 @@ impl Peer {
                     .map_err(Error::MutexPoisoned)?;
                 for (auth, peer_listen_addr) in map {
                     if !known_peers.contains(&auth) {
+                    // if !known_peers.contains(&auth) && auth != *self.self_id { TODO use this
                         if let Err(_) = self.new_auth_addr.send(
                             (Arc::new(auth), peer_listen_addr)
                         ).await {
@@ -430,6 +443,12 @@ impl Peer {
             .map_err(|_| {MutexPoisoned{}})?;
         info.last_address = addr;
         Ok(())
+    }
+
+    fn get_listen_addr(&self) -> Result<SocketAddr, MutexPoisoned> {
+        let info = self.peer_info.lock()
+            .map_err(|_| {MutexPoisoned{}})?;
+        Ok(info.last_address)
     }
 }
 

@@ -1,10 +1,10 @@
-use std::{collections::HashMap, sync::{Arc, Mutex}, net::{SocketAddr, SocketAddrV4}};
+use std::{collections::HashMap, sync::{Arc, Mutex}, net::SocketAddr};
 
 use tokio::{sync::mpsc, net::{TcpListener, TcpStream}};
 
 use crate::{
     peer::{self, Config, Identity, Info, Peer, Shared},
-    connection::{self, ConnectInfo, Connection}
+    connection::{self, Connection}
 };
 
 struct ConnectionNotifier {
@@ -181,44 +181,53 @@ impl Network {
         conn_opt: Option<Connection<TcpStream>>
     ) -> Result<(), Error> {
         tracing::debug!("Adding peer (auth {:?}, connection {:?}) to network", peer_id, conn_opt);
-        match self.notifiers.get_mut(&peer_id) {
-            Some(notifier) => {
-                tracing::debug!("Peer {} is already known", peer_id);
-                if let Some(conn) = conn_opt {
-                    tracing::debug!("Sending new connection to handler");
-                    notifier.notify_new_connection(peer_id, conn).await?;
-                }
-                else {
-                    tracing::debug!("No connection was provieded, ignoring");
-                }
-            },
-            None => {
-                tracing::debug!("Peer {} is unknown, creating a new handler", &peer_id);
+        if self.notifiers.contains_key(&peer_id) {
+            tracing::debug!("Peer {} is already known", peer_id);
+            if let Some(conn) = conn_opt {
                 match self.insert_info(peer_id.clone(), peer_listen_addr) {
                     Ok(Some(_)) => tracing::warn!("Inconsistency between `notifiers` and `peers_info`\
                         which probably happened from some previous error, this may lead to wrong \
                         behaviour."),
-                    Ok(None) => tracing::trace!("Successfully added new peer's info"),
+                    Ok(None) => (),
                     Err(e) =>
                         return Err(Error::PeerError(peer::Error::MutexPoisoned(e))),
                 }
-                let (peer, notifier) = ConnectionNotifier::peer_notifier(
-                    self.peers_info.clone(),
-                    peer_config,
-                    peer_id.clone(),
-                    self.listen_bind.port(),
-                    self.self_id.clone(),
-                    self.new_auth_addr_sender.clone()
-                ).map_err(Error::PeerCreationError)?;
-                self.notifiers.insert(
-                    peer_id,
-                    notifier
+                tracing::debug!("Sending new connection to handler");
+                let notifier = self.notifiers.get_mut(&peer_id).expect(
+                    "Key disappeared right after checking for contains_key, very strange"
                 );
-                tracing::trace!("Scheduling the handler for execution");
-                self.new_peers_sender.send((peer, conn_opt)).await
-                    .map_err(Error::MpscSendPeerError)?;
-            },
-        };
+                notifier.notify_new_connection(peer_id, conn).await?;
+            }
+            else {
+                tracing::debug!("No connection was provieded, ignoring");
+            }
+        }
+        else {
+            tracing::debug!("Peer {} is unknown, creating a new handler", &peer_id);
+            match self.insert_info(peer_id.clone(), peer_listen_addr) {
+                Ok(Some(_)) => tracing::warn!("Inconsistency between `notifiers` and `peers_info`\
+                    which probably happened from some previous error, this may lead to wrong \
+                    behaviour."),
+                Ok(None) => tracing::trace!("Successfully added new peer's info"),
+                Err(e) =>
+                    return Err(Error::PeerError(peer::Error::MutexPoisoned(e))),
+            }
+            let (peer, notifier) = ConnectionNotifier::peer_notifier(
+                self.peers_info.clone(),
+                peer_config,
+                peer_id.clone(),
+                self.listen_bind.port(),
+                self.self_id.clone(),
+                self.new_auth_addr_sender.clone()
+            ).map_err(Error::PeerCreationError)?;
+            self.notifiers.insert(
+                peer_id,
+                notifier
+            );
+            tracing::trace!("Scheduling the handler for execution");
+            self.new_peers_sender.send((peer, conn_opt)).await
+                .map_err(Error::MpscSendPeerError)?;
+        }
         Ok(())
     }
 
@@ -227,9 +236,11 @@ impl Network {
         peer_identity: Arc<Identity>,
         peer_listen_addr: SocketAddr,
     ) -> Result<Option<Shared<Info>>, peer::MutexPoisoned> {
+        tracing::debug!("Updating {}'s listen address to {}", peer_identity, peer_listen_addr);
         let mut info_map = self.peers_info.lock()
             .map_err(|_| {peer::MutexPoisoned{}})?;
         let new_info = Arc::new(Mutex::new(Info::new(peer_listen_addr)));
+        tracing::debug!("Updated successfully");
         Ok(info_map.insert(peer_identity, new_info))
     }
 }
