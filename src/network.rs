@@ -84,7 +84,7 @@ impl Network {
     pub async fn start(
         mut self,  
     ) -> std::io::Result<()> {
-        log::debug!("Starting to listen on addr {:?}", self.listen_bind);
+        tracing::debug!("Starting to listen on addr {:?}", self.listen_bind);
         let listener = TcpListener::bind(self.listen_bind).await?;
         loop {
             let new_peer = self.new_peers_receiver.recv();
@@ -93,26 +93,26 @@ impl Network {
                 listen_res = listener.accept() => {
                     match listen_res {
                         Ok((stream, _addr)) => {
-                            log::debug!("New incoming connection from {:?}", stream.peer_addr());
+                            tracing::debug!("New incoming connection from {:?}", stream.peer_addr());
                             if let Err(Error::PeerError(e)) = self.handle_new_con(
                                 stream, self.peer_config.clone()
                             ).await {
                                 match e {
                                     peer::Error::ConnectionError(_) |
-                                    peer::Error::UnexpectedMessage(_) => log::warn!("{:?}", e),
+                                    peer::Error::UnexpectedMessage(_) => tracing::warn!("{:?}", e),
                                     peer::Error::MutexPoisoned(_) => {
-                                        log::error!("Some mutex was poisoned, unable to continue");
+                                        tracing::error!("Some mutex was poisoned, unable to continue");
                                         return Ok(())
                                     },
                                     peer::Error::ChannelClosed(s) => {
-                                        log::error!("Channel {} was closed,
+                                        tracing::error!("Channel {} was closed,
                                             peer can't be handled without it", s);
                                         return Ok(())
                                     }
                                 }
                             };
                         },
-                        Err(e) => log::warn!("Couldn't accept incoming connection: {}", e),
+                        Err(e) => tracing::warn!("Couldn't accept incoming connection: {}", e),
                     };
                 }
                 auth_opt = new_auth => {
@@ -121,10 +121,10 @@ impl Network {
                             if let Err(e) = self.add_to_network(
                                 peer_id, peer_listen_addr, self.peer_config.clone(), None
                             ).await {
-                                log::warn!("Error adding peer by auth info: {:?}", e);
+                                tracing::warn!("Error adding peer by auth info: {:?}", e);
                             }
                         },
-                        None => log::error!("New auth was closed unexpectedly, can't work properly"),
+                        None => tracing::error!("New auth was closed unexpectedly, can't work properly"),
                     }
                 }
                 peer_opt = new_peer => {
@@ -132,7 +132,7 @@ impl Network {
                         Some((mut peer, conn)) => {
                             tokio::spawn(async move {peer.handle_peer(conn).await});
                         },
-                        None => log::error!("New peers was closed unexpectedly, can't work properly"),
+                        None => tracing::error!("New peers was closed unexpectedly, can't work properly"),
                     }
                 }
             };
@@ -142,13 +142,13 @@ impl Network {
     pub async fn start_connect(
         mut self, connect_addr: SocketAddr
     ) -> std::io::Result<()> {
-        log::trace!("Connecting to {}...", connect_addr);
+        tracing::trace!("Connecting to {}...", connect_addr);
         let init_connection = TcpStream::connect(connect_addr).await?;
-        log::trace!("Established TCP connection with {:?}", init_connection.peer_addr());
+        tracing::trace!("Established TCP connection with {:?}", init_connection.peer_addr());
         if let Err(e) = self.handle_new_con(
             init_connection, self.peer_config.clone()
         ).await {
-            log::error!("Could not join network through {}: {:?}", connect_addr, e);
+            tracing::error!("Could not join network through {}: {:?}", connect_addr, e);
         };
         self.start().await?;
         Ok(())
@@ -180,25 +180,25 @@ impl Network {
         peer_config: Config,
         conn_opt: Option<Connection<TcpStream>>
     ) -> Result<(), Error> {
-        log::debug!("Adding peer (auth {:?}, connection {:?}) to network", peer_id, conn_opt);
+        tracing::debug!("Adding peer (auth {:?}, connection {:?}) to network", peer_id, conn_opt);
         match self.notifiers.get_mut(&peer_id) {
             Some(notifier) => {
-                log::debug!("Peer {} is already known", peer_id);
+                tracing::debug!("Peer {} is already known", peer_id);
                 if let Some(conn) = conn_opt {
-                    log::debug!("Sending new connection to handler");
+                    tracing::debug!("Sending new connection to handler");
                     notifier.notify_new_connection(peer_id, conn).await?;
                 }
                 else {
-                    log::debug!("No connection was provieded, ignoring");
+                    tracing::debug!("No connection was provieded, ignoring");
                 }
             },
             None => {
-                log::debug!("Peer {} is unknown, creating a new handler", &peer_id);
+                tracing::debug!("Peer {} is unknown, creating a new handler", &peer_id);
                 match self.insert_info(peer_id.clone(), peer_listen_addr) {
-                    Ok(Some(_)) => log::warn!("Inconsistency between `notifiers` and `peers_info`\
+                    Ok(Some(_)) => tracing::warn!("Inconsistency between `notifiers` and `peers_info`\
                         which probably happened from some previous error, this may lead to wrong \
                         behaviour."),
-                    Ok(None) => log::trace!("Successfully added new peer's info"),
+                    Ok(None) => tracing::trace!("Successfully added new peer's info"),
                     Err(e) =>
                         return Err(Error::PeerError(peer::Error::MutexPoisoned(e))),
                 }
@@ -214,7 +214,7 @@ impl Network {
                     peer_id,
                     notifier
                 );
-                log::trace!("Scheduling the handler for execution");
+                tracing::trace!("Scheduling the handler for execution");
                 self.new_peers_sender.send((peer, conn_opt)).await
                     .map_err(Error::MpscSendPeerError)?;
             },

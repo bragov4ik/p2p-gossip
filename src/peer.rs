@@ -127,7 +127,7 @@ impl Peer {
         let mut hb_send_interval = interval(self.config.hb_period);
         let mut hb_recv_interval = interval(self.config.hb_timeout);
 
-        log::debug!("Start handling a peer {}", *self.peer_id);
+        tracing::debug!("Start handling a peer {}", *self.peer_id);
 
         loop {
             loop {
@@ -160,16 +160,16 @@ impl Peer {
                         Error::ConnectionError(conn_e) => {
                             match conn_e {
                                 connection::Error::SerializationError(e) => 
-                                    log::warn!("{}", e),
-                                connection::Error::IOError(e) => log::warn!("{}", e),
+                                    tracing::warn!("{}", e),
+                                connection::Error::IOError(e) => tracing::warn!("{}", e),
                                 connection::Error::StreamEnded => {
-                                    log::error!("Connection closed");
+                                    tracing::error!("Connection closed");
                                     break;
                                 },
                             }
                         },
                         Error::UnexpectedMessage(m) => {
-                            log::warn!("Received unexpected message {}, ignoring", m);
+                            tracing::warn!("Received unexpected message {}, ignoring", m);
                         },
                         Error::MutexPoisoned(_) => {
                             return Err(e);
@@ -192,14 +192,14 @@ impl Peer {
                 ).await;
                 match res {
                     Ok((conn, new_listen)) => {
-                        log::info!("Reconnected successfully, continuing operation");
+                        tracing::info!("Reconnected successfully, continuing operation");
                         conn_opt = Some(conn);
                         self.update_listen_addr(new_listen)
                             .map_err(Error::MutexPoisoned)?;
                         break;
                     },
                     Err(Error::MutexPoisoned(_)) => { return Err(res.unwrap_err()) },
-                    Err(e) => log::warn!("Error while reconnecting; trying again: {:?}", e),
+                    Err(e) => tracing::warn!("Error while reconnecting; trying again: {:?}", e),
                 }
             }
         }
@@ -220,6 +220,7 @@ impl Peer {
                 connect_res = try_connect => {
                     match connect_res {
                         Ok(stream) => {
+                            tracing::trace!("Trying to connect to {:?}", peer_listen_addr);
                             let peer_con_addr = stream.peer_addr()
                                 .map_err(connection::Error::IOError)
                                 .map_err(Error::ConnectionError)?;
@@ -231,15 +232,15 @@ impl Peer {
                                     if *peer_id_received == peer_id {
                                         let mut peer_listen_addr = peer_con_addr;
                                         peer_listen_addr.set_port(peer_listen_port);
-                                        return Ok((conn, peer_con_addr))
+                                        return Ok((conn, peer_listen_addr))
                                     }
                                     else {
-                                        log::info!("Peer's identity didn't match");
+                                        tracing::info!("Peer's identity didn't match");
                                         continue;
                                     }
                                 },
                                 Err(e) =>
-                                    log::warn!("Error while authenticating: {:?}", e),
+                                    tracing::warn!("Error while authenticating: {:?}", e),
                             };
                             Ok(())
                         },
@@ -253,7 +254,7 @@ impl Peer {
                         Some((peer_id_received, conn)) => {
                             // Double-check the identity, just in case
                             if *peer_id_received != peer_id {
-                                log::error!("Received connection with wrong identity from the
+                                tracing::error!("Received connection with wrong identity from the
                                     network which shouldn't happen, ignoring");
                                 continue;
                             }
@@ -270,7 +271,7 @@ impl Peer {
                 }
             };
             if let Err(e) = res {
-                log::warn!("Error while reconnecting to {:?}: {:?}", peer_listen_addr, e);
+                tracing::warn!("Error while reconnecting to {:?}: {:?}", peer_listen_addr, e);
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue
             }
@@ -282,7 +283,7 @@ impl Peer {
     ) -> Result<(Arc<Identity>, u16), Error> {
         // For logging only
         let peer_addr = conn.inner_ref().peer_addr();
-        log::trace!("Sending auth info to {:?}..", peer_addr);
+        tracing::trace!("Sending auth info to {:?}..", peer_addr);
 
         conn.send_message(Message::Pair(
             ConnectInfo{
@@ -292,18 +293,18 @@ impl Peer {
         )).await
             .map_err(Error::ConnectionError)?;
 
-        log::trace!("Info sent to {:?}!", peer_addr);
-        log::trace!("Waiting for auth info from {:?}..", peer_addr);
+        tracing::trace!("Info sent to {:?}!", peer_addr);
+        tracing::trace!("Waiting for auth info from {:?}..", peer_addr);
 
         let m = conn.recv_message().await
             .map_err(Error::ConnectionError)?;
         if let connection::Message::Pair(info) = m {
-            log::trace!("Received auth info from {:?}!", peer_addr);
+            tracing::trace!("Received auth info from {:?}!", peer_addr);
             let identity = Arc::new(info.identity);
             Ok((identity, info.listen_port))
         }
         else {
-            log::info!("Received {:?} from {:?}, but expected auth info", m, peer_addr);
+            tracing::info!("Received {:?} from {:?}, but expected auth info", m, peer_addr);
             conn.send_message(
                 connection::Message::Error("Expected `AddMe` message as first one".to_string())
             ).await
@@ -315,26 +316,26 @@ impl Peer {
     async fn handle_message(
         &mut self, m: Message, conn: &mut Connection<TcpStream>
     ) -> Result<(), Error> {
-        log::debug!("Received (from {}): {:?}", *self.peer_id, m);
+        tracing::debug!("Received (from {}): {:?}", *self.peer_id, m);
         match m {
             Message::Ping => {
                 let info = self.get_info_copy()
                     .map_err(Error::MutexPoisoned)?;
-                log::info!("{}/{} - {}", self.peer_id, info.last_address, m);
+                tracing::info!("{}/{} - {}", self.peer_id, info.last_address, m);
             },
             Message::Heartbeat => (), // We update timer on each activity after match
             Message::ListPeersRequest => {
-                log::trace!("Listing peers..");
+                tracing::trace!("Listing peers..");
                 let list = self.list_peers()
                     .map_err(Error::MutexPoisoned)?
                     .into_iter().collect();
-                log::trace!("Peers listed, sending the list...");
+                tracing::trace!("Peers listed, sending the list...");
                 conn.send_message(Message::ListPeersResponse(list)).await
                     .map_err(Error::ConnectionError)?;
-                log::trace!("The list has been sent to {}", *self.peer_id);
+                tracing::trace!("The list has been sent to {}", *self.peer_id);
             },
             Message::ListPeersResponse(map) => {
-                log::trace!(
+                tracing::trace!(
                     "Received list of peers from {}, looking for new entries",
                     *self.peer_id
                 );
@@ -352,7 +353,7 @@ impl Peer {
             },
             Message::Pair(_) => return Err(Error::UnexpectedMessage(m.clone())), // unexpected?
 
-            Message::Error(s) => log::error!("Peer sent error: {}", s),
+            Message::Error(s) => tracing::error!("Peer sent error: {}", s),
         };
         self.last_active = Instant::now();
         Ok(())

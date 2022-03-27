@@ -19,7 +19,7 @@ struct Args {
 #[tokio::main]
 async fn main() {
     // Log configuration
-    simple_logger::SimpleLogger::new().init().unwrap();
+    tracing_subscriber::fmt::init();
 
     // Application configuration
     let args = Args::parse();
@@ -31,10 +31,10 @@ async fn main() {
         hb_timeout: Duration::from_secs(3),
     };
 
-    log::info!("Launching peer");
-    log::trace!("\tidentity: {}", identity);
-    log::trace!("\tlisten_addr: {}", listen_addr);
-    log::trace!("\tpeer_config: {}", config);
+    tracing::info!("Launching peer");
+    tracing::trace!("\tidentity: {}", identity);
+    tracing::trace!("\tlisten_addr: {}", listen_addr);
+    tracing::trace!("\tpeer_config: {}", config);
     let net = network::Network::new(identity, listen_addr, config);
 
     let res = match args.connect {
@@ -48,7 +48,7 @@ async fn main() {
     match res {
         Ok(_) => println!("Shutting down.."),
         Err(e) => {
-            log::error!("Error running the peer: {}", e);
+            tracing::error!("Error running the peer: {}", e);
             println!("Error running the peer {}.\nShutting down..", e)
         },
     }
