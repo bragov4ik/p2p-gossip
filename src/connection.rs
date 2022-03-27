@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, fmt::Display, collections::HashMap};
+use std::{net::SocketAddr, fmt::Display};
 use serde::{Serialize, Deserialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{BytesCodec, Framed, Decoder};
@@ -10,7 +10,7 @@ pub enum Message {
     Ping,
     Heartbeat,
     ListPeersRequest,
-    ListPeersResponse(HashMap<peer::Identity, SocketAddr>),
+    ListPeersResponse(Vec<AuthInfo>),
     Authenticate(AuthInfo),
     Error(String),
 }
@@ -83,6 +83,10 @@ where
         let m = bincode::deserialize(bytes)
             .map_err(Error::SerializationError)?;
         Ok(m)
+    }
+
+    pub fn inner_ref(&self) -> &T {
+        self.framed_stream.get_ref()
     }
 }
 

@@ -25,18 +25,24 @@ async fn main() {
     let args = Args::parse();
     let identity = rand::random::<u64>();
     let listen_addr = SocketAddr::new("0.0.0.0".parse().unwrap(), args.port);
-    let net = network::Network::new(identity, listen_addr);
     let config = peer::Config{
         ping_period: Duration::from_secs(args.period),
         hb_period: Duration::from_secs(1),
         hb_timeout: Duration::from_secs(3),
     };
+
+    log::info!("Launching peer");
+    log::trace!("\tidentity: {}", identity);
+    log::trace!("\tlisten_addr: {}", listen_addr);
+    log::trace!("\tpeer_config: {}", config);
+    let net = network::Network::new(identity, listen_addr, config);
+
     let res = match args.connect {
         Some(remote_addr) => {
-            net.start_connect(config, remote_addr).await
+            net.start_connect(remote_addr).await
         },
         None => {
-            net.start(config).await
+            net.start().await
         },
     };
     match res {
