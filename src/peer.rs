@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, collections::HashMap, sync::{Arc, Mutex}};
 use tokio::{time::{Duration, Instant}, sync::mpsc, net::TcpStream};
 
-use crate::connection::{self, AuthInfo};
+use crate::connection::{self, ConnectInfo};
 use connection::{ Connection, Message };
 
 pub type Identity = u64;
@@ -34,6 +34,12 @@ pub enum Error {
 }
 
 #[derive(Debug)]
+pub enum CreationError {
+    MutexPoisoned(MutexPoisoned),
+    PeerInfoAbsent,
+}
+
+#[derive(Debug)]
 pub struct MutexPoisoned {}
 
 pub type Shared<T> = Arc<Mutex<T>>;
@@ -47,21 +53,19 @@ pub struct Peer
     // For receiving and checking
     last_active: Instant,
 
-    // Info about handled peer, shared
     peer_info: Shared<Info>,
-    peer_identity: Arc<Identity>,
-
-    // Info about local peer
-    self_auth: AuthInfo,
+    peer_id: Arc<Identity>,
+    self_listen_port: u16,
+    self_id: Arc<Identity>,
 
     // New connections to the peer, if received on listen port
-    new_connections: mpsc::Receiver<(AuthInfo, Connection<TcpStream>)>,
+    new_connections: mpsc::Receiver<(Arc<Identity>, Connection<TcpStream>)>,
 
     // Notifications to network about new discovered peers
-    new_auth: mpsc::Sender<AuthInfo>,
+    new_auth_addr: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
     
     // All known peers in the network (except local one)
-    peers_info: Shared<HashMap<Identity, Shared<Info>>>,
+    peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -79,27 +83,36 @@ impl std::fmt::Display for Config {
 }
 
 impl Peer {
-    // Produces Peer with associated channel for shutting it down
+    /// Produces Peer with associated channel for shutting it down
+    /// must insert info about this peer in `peers_info`
     pub fn new(
-        peers_info: Shared<HashMap<Identity, Shared<Info>>>,
+        peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
         config: Config,
-        peer_listen_addr: SocketAddr,
         peer_id: Arc<Identity>,
-        self_info: AuthInfo,
-        new_connections: mpsc::Receiver<(AuthInfo, Connection<TcpStream>)>,
-        new_peers: mpsc::Sender<AuthInfo>,
-    ) -> Result<Self, Error> {
-        let peer_info = Arc::new(Mutex::new(
-            Info::new(peer_listen_addr)
-        ));
+        self_listen_port: u16,
+        self_id: Arc<Identity>,
+        new_connections: mpsc::Receiver<(Arc<Identity>, Connection<TcpStream>)>,
+        new_auth_addr: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
+    ) -> Result<Self, CreationError> {
+        let peer_info = {
+            let info_map = peers_info.lock()
+                .map_err(|_| {CreationError::MutexPoisoned(MutexPoisoned{})})?;
+            info_map.get(&peer_id)
+                .map(|a| a.clone())
+        };
+        let peer_info = match peer_info {
+            Some(i) => i,
+            None => return Err(CreationError::PeerInfoAbsent),
+        };
         let peer = Peer {
             config,
             last_active: Instant::now(),
             peer_info,
-            peer_identity: peer_id,
-            self_auth: self_info,
+            peer_id,
+            self_listen_port,
+            self_id,
             new_connections,
-            new_auth: new_peers,
+            new_auth_addr,
             peers_info
         };
         Ok(peer)
@@ -114,7 +127,7 @@ impl Peer {
         let mut hb_send_interval = interval(self.config.hb_period);
         let mut hb_recv_interval = interval(self.config.hb_timeout);
 
-        log::debug!("Start handling a peer {}", *self.peer_identity);
+        log::debug!("Start handling a peer {}", *self.peer_id);
 
         loop {
             loop {
@@ -172,8 +185,9 @@ impl Peer {
                     .map_err(Error::MutexPoisoned)?;
                 let res = Self::reconnect(
                     info,
-                    (*self.peer_identity).clone(),
-                    self.self_auth.clone(),
+                    (*self.peer_id).clone(),
+                    self.self_id.clone(),
+                    self.self_listen_port,
                     &mut self.new_connections,
                 ).await;
                 match res {
@@ -192,8 +206,8 @@ impl Peer {
     }
 
     pub async fn reconnect(
-        peer_info: Info, peer_identity: u64, self_auth: AuthInfo,
-        new_connections: &mut mpsc::Receiver<(AuthInfo, Connection<TcpStream>)>
+        peer_info: Info, peer_id: u64, self_auth: Arc<Identity>, self_listen_port: u16,
+        new_connections: &mut mpsc::Receiver<(Arc<Identity>, Connection<TcpStream>)>
     ) -> Result<(Connection<TcpStream>, SocketAddr), Error> {
         loop {
             let peer_listen_addr = peer_info.last_address;
@@ -206,11 +220,18 @@ impl Peer {
                 connect_res = try_connect => {
                     match connect_res {
                         Ok(stream) => {
+                            let peer_con_addr = stream.peer_addr()
+                                .map_err(connection::Error::IOError)
+                                .map_err(Error::ConnectionError)?;
                             let mut conn = Connection::from_stream(stream);
-                            match Self::exchange_auth(self_auth.clone(), &mut conn).await {
-                                Ok(info) => {
-                                    if info.identity == peer_identity {
-                                        return Ok((conn, info.listen_addr))
+                            match Self::exchange_pair(
+                                self_auth.clone(), self_listen_port, &mut conn
+                            ).await {
+                                Ok((peer_id_received, peer_listen_port)) => {
+                                    if *peer_id_received == peer_id {
+                                        let mut peer_listen_addr = peer_con_addr;
+                                        peer_listen_addr.set_port(peer_listen_port);
+                                        return Ok((conn, peer_con_addr))
                                     }
                                     else {
                                         log::info!("Peer's identity didn't match");
@@ -229,15 +250,18 @@ impl Peer {
                 },
                 receive_opt = receive_connection => {
                     match receive_opt {
-                        Some((auth_info, conn)) => {
+                        Some((peer_id_received, conn)) => {
                             // Double-check the identity, just in case
-                            if auth_info.identity != peer_identity {
+                            if *peer_id_received != peer_id {
                                 log::error!("Received connection with wrong identity from the
                                     network which shouldn't happen, ignoring");
                                 continue;
                             }
+                            let peer_addr = conn.inner_ref().peer_addr()
+                                .map_err(connection::Error::IOError)
+                                .map_err(Error::ConnectionError)?;
                             // Connection was already authenticated, everything is Ok
-                            return Ok((conn, auth_info.listen_addr))
+                            return Ok((conn, peer_addr))
                         },
                         None => {
                             return Err(Error::ChannelClosed("new connections".to_string()))
@@ -247,20 +271,25 @@ impl Peer {
             };
             if let Err(e) = res {
                 log::warn!("Error while reconnecting to {:?}: {:?}", peer_listen_addr, e);
-                panic!();
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue
             }
         }
     }
 
-    pub async fn exchange_auth(
-        self_auth: AuthInfo, conn: &mut Connection<TcpStream>
-    ) -> Result<AuthInfo, Error> {
+    pub async fn exchange_pair(
+        self_auth: Arc<Identity>, self_listen_port: u16, conn: &mut Connection<TcpStream>
+    ) -> Result<(Arc<Identity>, u16), Error> {
         // For logging only
         let peer_addr = conn.inner_ref().peer_addr();
         log::trace!("Sending auth info to {:?}..", peer_addr);
 
-        conn.send_message(Message::Authenticate(self_auth.clone())).await
+        conn.send_message(Message::Pair(
+            ConnectInfo{
+                identity: (*self_auth),
+                listen_port: self_listen_port,
+            }
+        )).await
             .map_err(Error::ConnectionError)?;
 
         log::trace!("Info sent to {:?}!", peer_addr);
@@ -268,9 +297,10 @@ impl Peer {
 
         let m = conn.recv_message().await
             .map_err(Error::ConnectionError)?;
-        if let connection::Message::Authenticate(info) = m {
+        if let connection::Message::Pair(info) = m {
             log::trace!("Received auth info from {:?}!", peer_addr);
-            Ok(info)
+            let identity = Arc::new(info.identity);
+            Ok((identity, info.listen_port))
         }
         else {
             log::info!("Received {:?} from {:?}, but expected auth info", m, peer_addr);
@@ -285,40 +315,42 @@ impl Peer {
     async fn handle_message(
         &mut self, m: Message, conn: &mut Connection<TcpStream>
     ) -> Result<(), Error> {
-        log::debug!("Received (from {}): {:?}", *self.peer_identity, m);
+        log::debug!("Received (from {}): {:?}", *self.peer_id, m);
         match m {
             Message::Ping => {
                 let info = self.get_info_copy()
                     .map_err(Error::MutexPoisoned)?;
-                log::info!("{}/{} - {}", self.peer_identity, info.last_address, m);
+                log::info!("{}/{} - {}", self.peer_id, info.last_address, m);
             },
             Message::Heartbeat => (), // We update timer on each activity after match
             Message::ListPeersRequest => {
                 log::trace!("Listing peers..");
-                let map = self.list_peers()
+                let list = self.list_peers()
                     .map_err(Error::MutexPoisoned)?
                     .into_iter().collect();
                 log::trace!("Peers listed, sending the list...");
-                conn.send_message(Message::ListPeersResponse(map)).await
+                conn.send_message(Message::ListPeersResponse(list)).await
                     .map_err(Error::ConnectionError)?;
-                log::trace!("The list has been sent to {}", *self.peer_identity);
+                log::trace!("The list has been sent to {}", *self.peer_id);
             },
             Message::ListPeersResponse(map) => {
                 log::trace!(
                     "Received list of peers from {}, looking for new entries",
-                    *self.peer_identity
+                    *self.peer_id
                 );
                 let known_peers = self.known_peers()
                     .map_err(Error::MutexPoisoned)?;
-                for auth in map {
-                    if !known_peers.contains(&auth.identity) {
-                        if let Err(_) = self.new_auth.send(auth).await {
+                for (auth, peer_listen_addr) in map {
+                    if !known_peers.contains(&auth) {
+                        if let Err(_) = self.new_auth_addr.send(
+                            (Arc::new(auth), peer_listen_addr)
+                        ).await {
                             return Err(Error::ChannelClosed("new auth".to_owned()));
                         };
                     }
                 }
             },
-            Message::Authenticate(_) => return Err(Error::UnexpectedMessage(m.clone())), // unexpected?
+            Message::Pair(_) => return Err(Error::UnexpectedMessage(m.clone())), // unexpected?
 
             Message::Error(s) => log::error!("Peer sent error: {}", s),
         };
@@ -349,31 +381,31 @@ impl Peer {
         Ok(())
     }
 
-    fn list_peers(&self) -> Result<Vec<AuthInfo>, MutexPoisoned> {
+    fn list_peers(&self) -> Result<Vec<(Identity, SocketAddr)>, MutexPoisoned> {
         let peers_info = self.peers_info.lock()
             .map_err(|_| {MutexPoisoned{}})?;
         
-        // Get pairs `(peer_id, address)` or return `MutexPoisoned` error if at least one
+        // Get pairs `(peer_auth, address)` or return `MutexPoisoned` error if at least one
         // `Info` mutex was poisoned
         peers_info.iter()
             .map(|(s, i)| {
                 i.lock()
                     .map(|i| {
-                        AuthInfo{
-                            identity: s.to_owned(),
-                            listen_addr: i.last_address
-                        }
+                        (
+                            (**s).clone(),
+                            i.last_address,
+                        )
                     })
                     .map_err(|_| {MutexPoisoned{}})
             })
-            .collect::<Result<Vec<AuthInfo>, MutexPoisoned>>()
+            .collect::<Result<Vec<(Identity, SocketAddr)>, MutexPoisoned>>()
     }
 
     fn known_peers(&self) -> Result<std::collections::HashSet<Identity>, MutexPoisoned> {
         let peers_info = self.peers_info.lock()
             .map_err(|_| {MutexPoisoned{}})?;
         
-        Ok(peers_info.keys().map(|k| {k.to_owned()}).collect())
+        Ok(peers_info.keys().map(|k| {(**k).clone()}).collect())
     }
 
     // was made to isolate lock and not hold it across awaits

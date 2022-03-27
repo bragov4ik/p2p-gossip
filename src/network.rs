@@ -1,54 +1,57 @@
-use std::{collections::HashMap, sync::{Arc, Mutex}, net::SocketAddr};
+use std::{collections::HashMap, sync::{Arc, Mutex}, net::{SocketAddr, SocketAddrV4}};
 
 use tokio::{sync::mpsc, net::{TcpListener, TcpStream}};
 
 use crate::{
     peer::{self, Config, Identity, Info, Peer, Shared},
-    connection::{self, AuthInfo, Connection}
+    connection::{self, ConnectInfo, Connection}
 };
 
 struct ConnectionNotifier {
-    new_connections_sender: mpsc::Sender<(AuthInfo, Connection<TcpStream>)>,
+    new_connections_sender: mpsc::Sender<(Arc<Identity>, Connection<TcpStream>)>,
 }
 
 impl ConnectionNotifier {
     /// Create peer with associated notifier
+    /// must insert info about this peer in `peers_info`
     pub fn peer_notifier(
-        peers_info: Shared<HashMap<Identity, Shared<Info>>>,
+        peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
         config: Config,
-        addr: SocketAddr,
-        id: Identity,
-        self_info: connection::AuthInfo,
-        new_auth: mpsc::Sender<AuthInfo>,
-    ) -> Result<(Peer, Self), peer::Error> {
+        peer_id: Arc<Identity>,
+        self_listen_port: u16,
+        self_id: Arc<Identity>,
+        new_auth_addr: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
+    ) -> Result<(Peer, Self), peer::CreationError> {
         // TODO config the number
         let (new_connections_sender, new_connections) = mpsc::channel(32);
-        let id_arc = Arc::new(id);
         let peer = Peer::new(
-            peers_info, config, addr, id_arc, self_info, new_connections, new_auth
+            peers_info, config, peer_id, self_listen_port, self_id, new_connections, new_auth_addr
         )?;
         Ok((peer, ConnectionNotifier{new_connections_sender}))
     }
 
     pub async fn notify_new_connection(
-        &mut self, listen_addr: AuthInfo, conn: Connection<TcpStream>,
+        &mut self, id: Arc<Identity>, conn: Connection<TcpStream>,
     ) -> Result<(), Error> {
-        self.new_connections_sender.send((listen_addr, conn)).await
+        self.new_connections_sender.send((id, conn)).await
             .map_err(Error::MpscSendAddrError)
     }
 }
 
 pub struct Network {
-    peers_info: Shared<HashMap<Identity, Shared<Info>>>,
-    self_info: connection::AuthInfo,
-    listen_bind: SocketAddr,
     peer_config: Config,
+    
+    self_id: Arc<Identity>,
+    listen_bind: SocketAddr,
+
+    // Should be consistent with notifiers
+    peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
 
     // If a connection for some peer was established, it is sent through the corresponding notifier
-    notifiers: HashMap<Identity, ConnectionNotifier>,
+    notifiers: HashMap<Arc<Identity>, ConnectionNotifier>,
 
-    new_auth_receiver: mpsc::Receiver<AuthInfo>,
-    new_auth_sender: mpsc::Sender<AuthInfo>,
+    new_auth_addr_receiver: mpsc::Receiver<(Arc<Identity>, SocketAddr)>,
+    new_auth_addr_sender: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
 
     // New Peers handlers scheduled for run
     new_peers_receiver: mpsc::Receiver<(Peer, Option<Connection<TcpStream>>)>,
@@ -58,21 +61,23 @@ pub struct Network {
 #[derive(Debug)]
 pub enum Error {
     PeerError(peer::Error),
-    MpscSendAddrError(mpsc::error::SendError<(AuthInfo, Connection<TcpStream>)>),
+    PeerCreationError(peer::CreationError),
+    MpscSendAddrError(mpsc::error::SendError<(Arc<Identity>, Connection<TcpStream>)>),
     MpscSendPeerError(mpsc::error::SendError<(Peer, Option<Connection<TcpStream>>)>)
 }
 
 impl Network {
     pub fn new(identity: Identity, listen_addr: SocketAddr, peer_config: Config) -> Self {
         let peers_info = Arc::new(Mutex::new(HashMap::new()));
-        let self_info = connection::AuthInfo {identity, listen_addr,};
+        // Ensure immutability and avoid copying if it grows later
+        let self_id = Arc::new(identity);
         let notifiers = HashMap::new();
         // TODO config the numbers
         let (new_peers_sender, new_peers_receiver) = mpsc::channel(64);
         let (new_auth_sender, new_auth_receiver) = mpsc::channel(64);
         Network{
-            peers_info, self_info, listen_bind: listen_addr, peer_config, notifiers, 
-            new_auth_sender, new_auth_receiver, new_peers_receiver, new_peers_sender,
+            peers_info, self_id, listen_bind: listen_addr, peer_config, notifiers, 
+            new_auth_addr_sender: new_auth_sender, new_auth_addr_receiver: new_auth_receiver, new_peers_receiver, new_peers_sender,
         }
     }
 
@@ -81,11 +86,9 @@ impl Network {
     ) -> std::io::Result<()> {
         log::debug!("Starting to listen on addr {:?}", self.listen_bind);
         let listener = TcpListener::bind(self.listen_bind).await?;
-        self.self_info.listen_addr = listener.local_addr()?;
-        log::debug!("Local address {:?}", self.self_info.listen_addr);
         loop {
             let new_peer = self.new_peers_receiver.recv();
-            let new_auth = self.new_auth_receiver.recv();
+            let new_auth = self.new_auth_addr_receiver.recv();
             tokio::select! {
                 listen_res = listener.accept() => {
                     match listen_res {
@@ -114,8 +117,10 @@ impl Network {
                 }
                 auth_opt = new_auth => {
                     match auth_opt {
-                        Some(auth) => {
-                            if let Err(e) = self.add_to_network(auth, self.peer_config.clone(), None).await {
+                        Some((peer_id, peer_listen_addr)) => {
+                            if let Err(e) = self.add_to_network(
+                                peer_id, peer_listen_addr, self.peer_config.clone(), None
+                            ).await {
                                 log::warn!("Error adding peer by auth info: {:?}", e);
                             }
                         },
@@ -152,46 +157,61 @@ impl Network {
     async fn handle_new_con(
         &mut self, stream: TcpStream, peer_config: Config
     ) -> Result<(), Error> {
+        let peer_con_addr = stream.peer_addr()
+            .map_err(connection::Error::IOError)
+            .map_err(peer::Error::ConnectionError)
+            .map_err(Error::PeerError)?;
         let mut conn = Connection::from_stream(stream);
-        let peer_auth = peer::Peer::exchange_auth(
-            self.self_info.clone(), &mut conn
+        let (peer_id, peer_listen_port) = peer::Peer::exchange_pair(
+            self.self_id.clone(), self.listen_bind.port(), &mut conn
         ).await
             .map_err(Error::PeerError)?;
-        self.add_to_network(peer_auth, peer_config, Some(conn)).await?;
+        let peer_listen_addr = SocketAddr::new(peer_con_addr.ip(), peer_listen_port);
+        self.add_to_network(peer_id, peer_listen_addr, peer_config, Some(conn)).await?;
         Ok(())
     }
 
-    // Based on the identity either send Peer the connection or add a new peer handler
+    /// Based on the identity either send Peer the connection or add a new peer handler
+    /// peer_addr - address at which peer's listener's at
     async fn add_to_network(
         &mut self,
-        auth: AuthInfo,
+        peer_id: Arc<Identity>,
+        peer_listen_addr: SocketAddr,
         peer_config: Config,
         conn_opt: Option<Connection<TcpStream>>
     ) -> Result<(), Error> {
-        log::debug!("Adding peer (auth {:?}, connection {:?}) to network", auth, conn_opt);
-        match self.notifiers.get_mut(&auth.identity) {
+        log::debug!("Adding peer (auth {:?}, connection {:?}) to network", peer_id, conn_opt);
+        match self.notifiers.get_mut(&peer_id) {
             Some(notifier) => {
-                log::debug!("Peer {} is already known", &auth.identity);
+                log::debug!("Peer {} is already known", peer_id);
                 if let Some(conn) = conn_opt {
                     log::debug!("Sending new connection to handler");
-                    notifier.notify_new_connection(auth, conn).await?;
+                    notifier.notify_new_connection(peer_id, conn).await?;
                 }
                 else {
                     log::debug!("No connection was provieded, ignoring");
                 }
             },
             None => {
-                log::debug!("Peer {} is unknown, creating a new handler", &auth.identity);
+                log::debug!("Peer {} is unknown, creating a new handler", &peer_id);
+                match self.insert_info(peer_id.clone(), peer_listen_addr) {
+                    Ok(Some(_)) => log::warn!("Inconsistency between `notifiers` and `peers_info`\
+                        which probably happened from some previous error, this may lead to wrong \
+                        behaviour."),
+                    Ok(None) => log::trace!("Successfully added new peer's info"),
+                    Err(e) =>
+                        return Err(Error::PeerError(peer::Error::MutexPoisoned(e))),
+                }
                 let (peer, notifier) = ConnectionNotifier::peer_notifier(
                     self.peers_info.clone(),
                     peer_config,
-                    auth.listen_addr,
-                    auth.identity,
-                    self.self_info.clone(),
-                    self.new_auth_sender.clone()
-                ).map_err(Error::PeerError)?;
+                    peer_id.clone(),
+                    self.listen_bind.port(),
+                    self.self_id.clone(),
+                    self.new_auth_addr_sender.clone()
+                ).map_err(Error::PeerCreationError)?;
                 self.notifiers.insert(
-                    auth.identity,
+                    peer_id,
                     notifier
                 );
                 log::trace!("Scheduling the handler for execution");
@@ -200,5 +220,16 @@ impl Network {
             },
         };
         Ok(())
+    }
+
+    fn insert_info(
+        &mut self,
+        peer_identity: Arc<Identity>,
+        peer_listen_addr: SocketAddr,
+    ) -> Result<Option<Shared<Info>>, peer::MutexPoisoned> {
+        let mut info_map = self.peers_info.lock()
+            .map_err(|_| {peer::MutexPoisoned{}})?;
+        let new_info = Arc::new(Mutex::new(Info::new(peer_listen_addr)));
+        Ok(info_map.insert(peer_identity, new_info))
     }
 }

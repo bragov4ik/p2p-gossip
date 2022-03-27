@@ -1,17 +1,17 @@
-use std::{net::SocketAddr, fmt::Display};
+use std::{fmt::Display, net::SocketAddr};
 use serde::{Serialize, Deserialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{BytesCodec, Framed, Decoder};
 use futures::{ sink::SinkExt, stream::StreamExt };
-use crate::peer;
+use crate::peer::{self, Identity};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Message {
     Ping,
     Heartbeat,
     ListPeersRequest,
-    ListPeersResponse(Vec<AuthInfo>),
-    Authenticate(AuthInfo),
+    ListPeersResponse(Vec<(Identity, SocketAddr)>),
+    Pair(ConnectInfo),
     Error(String),
 }
 
@@ -22,21 +22,21 @@ impl Display for Message {
             Message::Heartbeat => write!(f, "Heartbeat"),
             Message::ListPeersRequest => write!(f, "ListPeersRequest"),
             Message::ListPeersResponse(map) => write!(f, "ListPeersResponse {:?}", map),
-            Message::Authenticate(add) => write!(f, "AddMe {}", add),
+            Message::Pair(add) => write!(f, "AddMe {}", add),
             Message::Error(s) => write!(f, "Error: {}", s),
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct AuthInfo {
+pub struct ConnectInfo {
     pub identity: peer::Identity,
-    pub listen_addr: SocketAddr,
+    pub listen_port: u16,
 }
 
-impl Display for AuthInfo {
+impl Display for ConnectInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{}", self.identity, self.listen_addr)
+        write!(f, "{}", self.identity)
     }
 }
 
