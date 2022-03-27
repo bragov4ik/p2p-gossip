@@ -4,11 +4,11 @@ use tokio::{sync::mpsc, net::{TcpListener, TcpStream}};
 
 use crate::{
     peer::{self, Config, Identity, Info, Peer, Shared},
-    connection::{self, LocalInfo, Connection}
+    connection::{self, AuthInfo, Connection}
 };
 
 struct ConnectionNotifier {
-    new_address_sender: mpsc::Sender<(SocketAddr, Connection<TcpStream>)>,
+    new_address_sender: mpsc::Sender<(AuthInfo, Connection<TcpStream>)>,
 }
 
 impl ConnectionNotifier {
@@ -19,18 +19,18 @@ impl ConnectionNotifier {
         conn: Connection<TcpStream>,
         addr: SocketAddr,
         id: Identity,
-        self_info: Arc<connection::LocalInfo>,
+        self_info: Arc<connection::AuthInfo>,
     ) -> Result<(Peer, Self), peer::Error> {
         // TODO config the number
         let (new_address_sender, new_address_receiver) = mpsc::channel(32);
         let peer = Peer::new_with_connection_update(
-            peers_info, config, conn, addr, id, self_info, new_address_receiver
+            peers_info, config, conn, addr, id, self_info,new_address_receiver
         )?;
         Ok((peer, ConnectionNotifier{new_address_sender}))
     }
 
     pub async fn notify_new_connection(
-        &mut self, listen_addr: SocketAddr, conn: Connection<TcpStream>,
+        &mut self, listen_addr: AuthInfo, conn: Connection<TcpStream>,
     ) -> Result<(), Error> {
         self.new_address_sender.send((listen_addr, conn)).await
             .map_err(Error::MpscSendAddrError)
@@ -38,9 +38,12 @@ impl ConnectionNotifier {
 }
 
 pub struct Network {
-    notifiers: HashMap<Identity, ConnectionNotifier>,
     peers_info: Shared<HashMap<Identity, Shared<Info>>>,
-    self_info: Arc<connection::LocalInfo>,
+    self_info: Arc<connection::AuthInfo>,
+
+    // If a connection for some peer was established, it is sent through the corresponding notifier
+    notifiers: HashMap<Identity, ConnectionNotifier>,
+
     // New Peers handlers scheduled for run
     new_peers_receiver: mpsc::Receiver<Peer>,
     new_peers_sender: mpsc::Sender<Peer>,
@@ -49,21 +52,24 @@ pub struct Network {
 #[derive(Debug)]
 pub enum Error {
     PeerError(peer::Error),
-    MpscSendAddrError(mpsc::error::SendError<(SocketAddr, Connection<TcpStream>)>),
+    MpscSendAddrError(mpsc::error::SendError<(AuthInfo, Connection<TcpStream>)>),
     MpscSendPeerError(mpsc::error::SendError<Peer>)
 }
 
 impl Network {
     pub fn new(identity: Identity, listen_addr: SocketAddr) -> Self {
         let peers_info = Arc::new(Mutex::new(HashMap::new()));
-        let peers = HashMap::new();
-        // TODO config the number
-        let (new_peers_sender, new_peers_receiver) = mpsc::channel(64);
-        let self_info = Arc::new(connection::LocalInfo {
+        let self_info = Arc::new(connection::AuthInfo {
             identity,
             listen_addr,
         });
-        Network{notifiers: peers, peers_info, self_info, new_peers_receiver, new_peers_sender}
+        let notifiers = HashMap::new();
+        // TODO config the number
+        let (new_peers_sender, new_peers_receiver) = mpsc::channel(64);
+        Network{
+            peers_info, self_info, notifiers,
+            new_peers_receiver, new_peers_sender
+        }
     }
 
     pub async fn start(
@@ -88,6 +94,11 @@ impl Network {
                                         log::error!("Some mutex was poisoned, unable to continue");
                                         return Ok(())
                                     },
+                                    peer::Error::ChannelClosed(s) => {
+                                        log::error!("Channel {} was closed,
+                                            peer can't be handled without it", s);
+                                        return Ok(())
+                                    }
                                 }
                             };
                         },
@@ -103,7 +114,7 @@ impl Network {
                             tokio::spawn(async move {peer.handle_peer().await});
                         },
                         None => {
-                            log::error!("New peers was closed unexpectedly, can't accept new peers");
+                            log::error!("New peers was closed unexpectedly, can't work properly");
                             continue;
                         },
                     }
@@ -112,11 +123,16 @@ impl Network {
         }
     }
 
-    // pub async fn start_connect(
-    //     mut self, peer_config: Config, listen_addr: SocketAddr, connect_addr: SocketAddr
-    // ) -> std::io::Result<()> {
-
-    // }
+    pub async fn start_connect(
+        mut self, peer_config: Config, connect_addr: SocketAddr
+    ) -> std::io::Result<()> {
+        let init_connection = TcpStream::connect(connect_addr).await?;
+        if let Err(e) = self.manage_new_con(init_connection, peer_config.clone()).await {
+            log::error!("Could not join network through {}: {:?}", connect_addr, e);
+        };
+        self.start(peer_config).await?;
+        Ok(())
+    }
 
     async fn manage_new_con(
         &mut self, stream: TcpStream, peer_config: Config
@@ -130,7 +146,7 @@ impl Network {
     // Get identity of the newcomer
     async fn initiate_peer(
         &self, conn: &mut Connection<TcpStream>
-    ) -> Result<LocalInfo, Error> {
+    ) -> Result<AuthInfo, Error> {
         // First message in the connection should be AddMe with info
         let m = conn.recv_message().await
             .map_err(peer::Error::ConnectionError)
@@ -148,18 +164,20 @@ impl Network {
         }
     }
 
-    // Based on the identity either notify Peer about new address or add new one
+    // Based on the identity either send Peer the connection or add a new peer handler
     async fn add_to_network(
         &mut self,
-        id_addr: LocalInfo,
+        id_addr: AuthInfo,
         peer_config: Config,
         conn: Connection<TcpStream>
     ) -> Result<(), Error> {
         match self.notifiers.get_mut(&id_addr.identity) {
             Some(notifier) => {
-                notifier.notify_new_connection(id_addr.listen_addr, conn).await?;
+                // Assigned peer was found, forwarding connection
+                notifier.notify_new_connection(id_addr, conn).await?;
             },
             None => {
+                // Couldn't find such peer, creating new handler
                 let (peer, notifier) = ConnectionNotifier::peer_notifier(
                     self.peers_info.clone(),
                     peer_config,

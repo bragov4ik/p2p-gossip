@@ -11,7 +11,7 @@ pub enum Message {
     Heartbeat,
     ListPeersRequest,
     ListPeersResponse(HashMap<peer::Identity, SocketAddr>),
-    Authenticate(LocalInfo),
+    Authenticate(AuthInfo),
     Error(String),
 }
 
@@ -29,12 +29,12 @@ impl Display for Message {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct LocalInfo {
+pub struct AuthInfo {
     pub identity: peer::Identity,
     pub listen_addr: SocketAddr,
 }
 
-impl Display for LocalInfo {
+impl Display for AuthInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}-{}", self.identity, self.listen_addr)
     }

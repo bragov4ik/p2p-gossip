@@ -31,10 +31,17 @@ async fn main() {
     };
     let res = match args.connect {
         Some(remote_addr) => {
-            todo!()
+            net.start_connect(config, remote_addr).await
         },
         None => {
             net.start(config).await
         },
     };
+    match res {
+        Ok(_) => println!("Shutting down.."),
+        Err(e) => {
+            log::error!("Error running the peer: {}", e);
+            println!("Error running the peer {}.\nShutting down..", e)
+        },
+    }
 }
