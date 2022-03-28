@@ -280,8 +280,8 @@ impl Peer {
                             let peer_con_addr = stream.peer_addr()
                                 .map_err(connection::Error::IOError)
                                 .map_err(Error::ConnectionError)?;
-                            match Self::auth_client(
-                                self_auth.clone(), self_listen_port, stream,
+                            match Self::auth_existing_client(
+                                self_auth.clone(), peer_id.clone(), self_listen_port, stream,
                                 self_private_key.clone(), self_cert.clone()
                             ).await {
                                 Ok((peer_id_received, peer_listen_port, conn)) => {
@@ -334,19 +334,49 @@ impl Peer {
         }
     }
 
-    pub async fn auth_client(
+    pub async fn auth_new_client(
         self_auth: Arc<Identity>,
         self_listen_port: u16,
         stream: TcpStream,
         private_key: PrivateKey,
         cert: Certificate,
     ) -> Result<(Arc<Identity>, u16, Connection<TlsStream<TcpStream>>), Error> {
-        let (peer_id, peer_listen_port, conn) = Self::exchange_pair(
+        Self::auth_client(
+            self_auth, None, self_listen_port, stream, private_key, cert
+        ).await
+    }
+
+    pub async fn auth_existing_client(
+        self_auth: Arc<Identity>,
+        peer_auth: Arc<Identity>,
+        self_listen_port: u16,
+        stream: TcpStream,
+        private_key: PrivateKey,
+        cert: Certificate,
+    ) -> Result<(Arc<Identity>, u16, Connection<TlsStream<TcpStream>>), Error> {
+        Self::auth_client(
+            self_auth, Some(peer_auth), self_listen_port, stream, private_key, cert
+        ).await
+    }
+
+    async fn auth_client(
+        self_auth: Arc<Identity>,
+        peer_auth: Option<Arc<Identity>>,
+        self_listen_port: u16,
+        stream: TcpStream,
+        private_key: PrivateKey,
+        cert: Certificate,
+    ) -> Result<(Arc<Identity>, u16, Connection<TlsStream<TcpStream>>), Error> {
+        let (peer_auth_received, peer_listen_port, conn) = Self::exchange_pair(
             self_auth, self_listen_port, stream
         ).await?;
+        let peer_auth = match peer_auth {
+            Some(a) => a,
+            None => peer_auth_received,
+        };
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
-            .with_custom_certificate_verifier(auth::PeerVerifier::new(*peer_id))
+            .with_custom_certificate_verifier(auth::PeerVerifier::new(*peer_auth))
             .with_single_cert(vec![cert], private_key)
             .map_err(Error::TlsError)?;
         let config = TlsConnector::from(Arc::new(config));
@@ -356,7 +386,7 @@ impl Peer {
             .map_err(Error::ConnectionError)?;
         let stream = tokio_rustls::TlsStream::Client(stream);
         let conn = Connection::from_stream(stream);
-        Ok((peer_id, peer_listen_port, conn))
+        Ok((peer_auth, peer_listen_port, conn))
     }
 
     pub async fn auth_server(
@@ -622,11 +652,9 @@ mod tests {
     async fn accept_test_peer(
         listener: TcpListener,
         peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
-        peer_id: Arc<Identity>,
         self_id: Arc<Identity>,
         self_key: PrivateKey,
         self_cert: Certificate,
-        peer_listen_port: u16,
     ) -> Result<(), Error> {
         let stream = listener.accept().await
             .map_err(Error::IOError)?;
@@ -660,8 +688,10 @@ mod tests {
     ) -> Result<(), Error> {
         let stream = TcpStream::connect(connect_to).await
             .map_err(Error::IOError)?;
-        let (peer_id, peer_listen_port, conn) = Peer::auth_client(
+        let (peer_id, peer_listen_port, conn) = 
+        Peer::auth_existing_client(
             self_id.clone(),
+            peer_id,
             self_listen_port,
             stream, 
             self_key.clone(),
@@ -672,7 +702,7 @@ mod tests {
             peers_info,
             peer_id,
             self_id,
-            connect_to.port(),
+            peer_listen_port,
             self_listen_port,
             self_key,
             self_cert,
@@ -693,7 +723,6 @@ mod tests {
         let peers_info = init_testing();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
-        let peer1_listen_port = listen_addr.port();
         let (peer1_cert, peer1_key) = gen_private_key_cert();
         let (peer2_cert, peer2_key) = gen_private_key_cert();
         let peer1_id = Identity::new(&peer1_cert.0[..]);
@@ -711,10 +740,8 @@ mod tests {
             listener,
             peers_info.clone(),
             peer1_id.clone(),
-            peer2_id.clone(),
             peer2_key.clone(),
             peer2_cert.clone(),
-            peer1_listen_port,
         );
         let (res1, res2) = tokio::join!(peer1_test, peer2_test);
         res1.unwrap();

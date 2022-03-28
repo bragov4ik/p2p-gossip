@@ -203,7 +203,7 @@ impl Network {
                 ).await.map_err(Error::PeerError)?
             },
             false => {
-                peer::Peer::auth_client(
+                peer::Peer::auth_new_client(
                     self.self_id.clone(),
                     self.listen_bind.port(),
                     stream,
