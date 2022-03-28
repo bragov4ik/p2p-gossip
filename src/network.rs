@@ -11,16 +11,17 @@
 //! 
 use std::{collections::HashMap, sync::{Arc, Mutex}, net::SocketAddr};
 
+use rustls::{PrivateKey, Certificate};
 use tokio::{sync::mpsc, net::{TcpListener, TcpStream}};
-use tokio_rustls::{ TlsConnector, rustls::{ClientConfig, ServerConfig} };
+use tokio_rustls::{ TlsStream };
 
 use crate::{
-    peer::{self, Config, Info, Peer, Shared},
-    connection::{self, Connection}, authentication::Identity
+    peer::{self, Config, Info, Peer},
+    connection::{self, Connection}, auth::Identity, utils::{MutexPoisoned, Shared}
 };
 
 struct ConnectionNotifier {
-    new_connections_sender: mpsc::Sender<(Arc<Identity>, Connection<TcpStream>)>,
+    new_connections_sender: mpsc::Sender<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>,
 }
 
 impl ConnectionNotifier {
@@ -43,7 +44,7 @@ impl ConnectionNotifier {
     }
 
     pub async fn notify_new_connection(
-        &mut self, id: Arc<Identity>, conn: Connection<TcpStream>,
+        &mut self, id: Arc<Identity>, conn: Connection<TlsStream<TcpStream>>,
     ) -> Result<(), Error> {
         self.new_connections_sender.send((id, conn)).await
             .map_err(Error::MpscSendAddrError)
@@ -52,6 +53,9 @@ impl ConnectionNotifier {
 
 pub struct Network {
     peer_config: Config,
+
+    self_private_key: PrivateKey,
+    self_cert: Certificate,
     
     self_id: Arc<Identity>,
     listen_bind: SocketAddr,
@@ -66,38 +70,37 @@ pub struct Network {
     new_auth_addr_sender: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
 
     // New Peers handlers scheduled for run
-    new_peers_receiver: mpsc::Receiver<(Peer, Option<Connection<TcpStream>>)>,
-    new_peers_sender: mpsc::Sender<(Peer, Option<Connection<TcpStream>>)>,
+    new_peers_receiver: mpsc::Receiver<(Peer, Option<Connection<TlsStream<TcpStream>>>)>,
+    new_peers_sender: mpsc::Sender<(Peer, Option<Connection<TlsStream<TcpStream>>>)>,
 }
 
 #[derive(Debug)]
 pub enum Error {
     PeerError(peer::Error),
     PeerCreationError(peer::CreationError),
-    MpscSendAddrError(mpsc::error::SendError<(Arc<Identity>, Connection<TcpStream>)>),
-    MpscSendPeerError(mpsc::error::SendError<(Peer, Option<Connection<TcpStream>>)>)
+    MpscSendAddrError(mpsc::error::SendError<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>),
+    MpscSendPeerError(mpsc::error::SendError<(Peer, Option<Connection<TlsStream<TcpStream>>>)>)
 }
 
 impl Network {
-    pub fn new(identity: Identity, listen_addr: SocketAddr, peer_config: Config) -> Self {
+    pub fn new(
+        self_private_key: PrivateKey,
+        self_cert: Certificate,
+        listen_addr: SocketAddr,
+        peer_config: Config
+    ) -> Self {
         let peers_info = Arc::new(Mutex::new(HashMap::new()));
         // Ensure immutability and avoid copying if it grows later
-        let self_id = Arc::new(identity);
+        let self_id = Identity::new(&self_cert.0[..]);
         let notifiers = HashMap::new();
         // TODO config the numbers
         let (new_peers_sender, new_peers_receiver) = mpsc::channel(64);
         let (new_auth_sender, new_auth_receiver) = mpsc::channel(64);
         Network{
-            peers_info, self_id, listen_bind: listen_addr, peer_config, notifiers, 
-            new_auth_addr_sender: new_auth_sender, new_auth_addr_receiver: new_auth_receiver, new_peers_receiver, new_peers_sender,
+            peers_info, self_private_key, self_cert, self_id, listen_bind: listen_addr, peer_config,
+            notifiers, new_auth_addr_sender: new_auth_sender,
+            new_auth_addr_receiver: new_auth_receiver, new_peers_receiver, new_peers_sender,
         }
-    }
-
-    fn config_tls() {
-        let mut config = ServerConfig::builder()
-            .with_safe_defaults()
-            .with_custom;
-        let connector = TlsConnector::from(Arc::new(config));
     }
 
     pub async fn start_listen(
@@ -114,10 +117,10 @@ impl Network {
                         Ok((stream, _addr)) => {
                             tracing::debug!("New incoming connection from {:?}", stream.peer_addr());
                             if let Err(Error::PeerError(e)) = self.handle_new_con(
-                                stream, self.peer_config.clone()
+                                stream, self.peer_config.clone(), true
                             ).await {
                                 match e {
-                                    peer::Error::ConnectionError(_) |
+                                    peer::Error::ConnectionError(_) | peer::Error::TlsError(_) |
                                     peer::Error::UnexpectedMessage(_) => tracing::warn!("{:?}", e),
                                     peer::Error::MutexPoisoned(_) => {
                                         tracing::error!("Some mutex was poisoned, unable to continue");
@@ -149,7 +152,15 @@ impl Network {
                 peer_opt = new_peer => {
                     match peer_opt {
                         Some((mut peer, conn)) => {
-                            tokio::spawn(async move {peer.handle_peer(conn).await});
+                            let self_private_key = self.self_private_key.clone();
+                            let self_clone = self.self_cert.clone();
+                            tokio::spawn(async move {
+                                peer.handle_peer(
+                                    conn,
+                                    self_private_key,
+                                    self_clone,
+                                ).await
+                            });
                         },
                         None => tracing::error!("New peers was closed unexpectedly, can't work properly"),
                     }
@@ -165,7 +176,7 @@ impl Network {
         let init_connection = TcpStream::connect(connect_addr).await?;
         tracing::trace!("Established TCP connection with {:?}", init_connection.peer_addr());
         if let Err(e) = self.handle_new_con(
-            init_connection, self.peer_config.clone()
+            init_connection, self.peer_config.clone(), false
         ).await {
             tracing::error!("Could not join network through {}: {:?}", connect_addr, e);
         };
@@ -175,17 +186,32 @@ impl Network {
 
     #[tracing::instrument(skip_all, fields(peer_addr=?stream.peer_addr().map(|a| a.to_string())))]
     async fn handle_new_con(
-        &mut self, stream: TcpStream, peer_config: Config
+        &mut self, stream: TcpStream, peer_config: Config, incoming: bool
     ) -> Result<(), Error> {
         let peer_con_addr = stream.peer_addr()
             .map_err(connection::Error::IOError)
             .map_err(peer::Error::ConnectionError)
             .map_err(Error::PeerError)?;
-        let mut conn = Connection::from_stream(stream);
-        let (peer_id, peer_listen_port) = peer::Peer::exchange_pair(
-            self.self_id.clone(), self.listen_bind.port(), &mut conn
-        ).await
-            .map_err(Error::PeerError)?;
+        let (peer_id, peer_listen_port, conn) = match incoming {
+            true => {
+                peer::Peer::auth_server(
+                    self.self_id.clone(),
+                    self.listen_bind.port(),
+                    stream,
+                    self.self_private_key.clone(),
+                    self.self_cert.clone(),
+                ).await.map_err(Error::PeerError)?
+            },
+            false => {
+                peer::Peer::auth_client(
+                    self.self_id.clone(),
+                    self.listen_bind.port(),
+                    stream,
+                    self.self_private_key.clone(),
+                    self.self_cert.clone(),
+                ).await.map_err(Error::PeerError)?
+            },
+        };
         let peer_listen_addr = SocketAddr::new(peer_con_addr.ip(), peer_listen_port);
         self.add_to_network(peer_id, peer_listen_addr, peer_config, Some(conn)).await?;
         Ok(())
@@ -199,7 +225,7 @@ impl Network {
         peer_id: Arc<Identity>,
         peer_listen_addr: SocketAddr,
         peer_config: Config,
-        conn_opt: Option<Connection<TcpStream>>
+        conn_opt: Option<Connection<TlsStream<TcpStream>>>
     ) -> Result<(), Error> {
         tracing::debug!("Adding peer to network");
         if peer_id == self.self_id {
@@ -261,10 +287,10 @@ impl Network {
         &mut self,
         peer_identity: Arc<Identity>,
         peer_listen_addr: SocketAddr,
-    ) -> Result<Option<Shared<Info>>, peer::MutexPoisoned> {
+    ) -> Result<Option<Shared<Info>>, MutexPoisoned> {
         tracing::debug!("Updating listen address");
         let mut info_map = self.peers_info.lock()
-            .map_err(|_| {peer::MutexPoisoned{}})?;
+            .map_err(|_| {MutexPoisoned{}})?;
         let new_info = Arc::new(Mutex::new(Info::new(peer_listen_addr)));
         tracing::debug!("Updated successfully");
         Ok(info_map.insert(peer_identity, new_info))

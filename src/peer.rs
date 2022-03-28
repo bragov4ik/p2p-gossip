@@ -1,9 +1,11 @@
-use std::{net::SocketAddr, collections::HashMap, sync::{Arc, Mutex}};
+use std::{net::SocketAddr, collections::HashMap, sync::{Arc, Mutex}, fmt::Display};
+use rustls::{Certificate, PrivateKey};
+use serde::{Serialize, Deserialize};
 use tokio::{time::{Duration, Instant}, sync::mpsc, net::TcpStream};
-use tokio_rustls::{TlsStream, rustls::{ServerConfig, ClientConfig, RootCertStore}};
+use tokio_rustls::{TlsStream, TlsConnector, TlsAcceptor};
 
-use crate::{connection::{self, ConnectInfo}, authentication::Identity};
-use connection::{ Connection, Message };
+use crate::{connection::{self, }, auth::{Identity, self}, utils::{MutexPoisoned, Shared}};
+use connection::{ Connection,  };
 
 #[derive(Debug, Clone)]
 pub struct Info {
@@ -30,6 +32,7 @@ pub enum Error {
     MutexPoisoned(MutexPoisoned),
     // Channel understandable name
     ChannelClosed(String),
+    TlsError(rustls::Error),
 }
 
 #[derive(Debug)]
@@ -38,12 +41,41 @@ pub enum CreationError {
     PeerInfoAbsent,
 }
 
-#[derive(Debug)]
-pub struct MutexPoisoned {}
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum Message {
+    Ping,
+    Heartbeat,
+    ListPeersRequest,
+    ListPeersResponse(Vec<(Identity, SocketAddr)>),
+    Pair(ConnectInfo),
+    Error(String),
+}
 
-pub type Shared<T> = Arc<Mutex<T>>;
+impl Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Message::Ping => write!(f, "Ping"),
+            Message::Heartbeat => write!(f, "Heartbeat"),
+            Message::ListPeersRequest => write!(f, "ListPeersRequest"),
+            Message::ListPeersResponse(map) => write!(f, "ListPeersResponse {:?}", map),
+            Message::Pair(add) => write!(f, "AddMe {}", add),
+            Message::Error(s) => write!(f, "Error: {}", s),
+        }
+    }
+}
 
-// TODO add timeouts where applicable
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ConnectInfo {
+    pub identity: Identity,
+    pub listen_port: u16,
+}
+
+impl Display for ConnectInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.identity)
+    }
+}
+
 #[derive(Debug)]
 pub struct Peer
 {
@@ -58,7 +90,7 @@ pub struct Peer
     self_id: Arc<Identity>,
 
     // New connections to the peer, if received on listen port
-    new_connections: mpsc::Receiver<(Arc<Identity>, Connection<TcpStream>)>,
+    new_connections: mpsc::Receiver<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>,
 
     // Notifications to network about new discovered peers
     new_auth_addr: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
@@ -90,7 +122,7 @@ impl Peer {
         peer_id: Arc<Identity>,
         self_listen_port: u16,
         self_id: Arc<Identity>,
-        new_connections: mpsc::Receiver<(Arc<Identity>, Connection<TcpStream>)>,
+        new_connections: mpsc::Receiver<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>,
         new_auth_addr: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
     ) -> Result<Self, CreationError> {
         let peer_info = {
@@ -120,7 +152,12 @@ impl Peer {
     // Handle communication with a particular peer through a connection (if any)
     // tries to connect if no connection given
     #[tracing::instrument(skip_all)]
-    pub async fn handle_peer(&mut self, mut conn_opt: Option<Connection<TcpStream>>,) -> Result<(), Error>{
+    pub async fn handle_peer(
+        &mut self,
+        mut conn_opt: Option<Connection<TlsStream<TcpStream>>>,
+        self_private_key: PrivateKey,
+        self_cert: Certificate,
+    ) -> Result<(), Error>{
         use tokio::time::interval;
 
         let mut ping_interval = interval(self.config.ping_period);
@@ -183,6 +220,9 @@ impl Peer {
                         Error::UnexpectedMessage(m) => {
                             tracing::warn!("Received unexpected message {}, ignoring", m);
                         },
+                        Error::TlsError(e) => {
+                            tracing::warn!("Tls error: {}", e);
+                        },
                         Error::MutexPoisoned(_) => {
                             return Err(e);
                         },
@@ -200,6 +240,8 @@ impl Peer {
                     self.peer_id.clone(),
                     self.self_id.clone(),
                     self.self_listen_port,
+                    self_private_key.clone(),
+                    self_cert.clone(),
                     &mut self.new_connections,
                 ).await;
                 match res {
@@ -217,11 +259,12 @@ impl Peer {
         }
     }
 
-    #[tracing::instrument(skip(new_connections))]
+    // #[tracing::instrument(skip(new_connections))]
     pub async fn reconnect(
         peer_info: Info, peer_id: Arc<Identity>, self_auth: Arc<Identity>, self_listen_port: u16,
-        new_connections: &mut mpsc::Receiver<(Arc<Identity>, Connection<TcpStream>)>
-    ) -> Result<(Connection<TcpStream>, SocketAddr), Error> {
+        self_private_key: PrivateKey, self_cert: Certificate,
+        new_connections: &mut mpsc::Receiver<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>,
+    ) -> Result<(Connection<TlsStream<TcpStream>>, SocketAddr), Error> {
         loop {
             let peer_listen_addr = peer_info.last_address;
 
@@ -237,8 +280,9 @@ impl Peer {
                             let peer_con_addr = stream.peer_addr()
                                 .map_err(connection::Error::IOError)
                                 .map_err(Error::ConnectionError)?;
-                            match Self::exchange_pair(
-                                self_auth.clone(), self_listen_port, stream
+                            match Self::auth_client(
+                                self_auth.clone(), self_listen_port, stream,
+                                self_private_key.clone(), self_cert.clone()
                             ).await {
                                 Ok((peer_id_received, peer_listen_port, conn)) => {
                                     if *peer_id_received == *peer_id {
@@ -270,7 +314,7 @@ impl Peer {
                                     network which shouldn't happen, ignoring");
                                 continue;
                             }
-                            let peer_addr = conn.inner_ref().peer_addr()
+                            let peer_addr = conn.get_ref().get_ref().0.peer_addr()
                                 .map_err(connection::Error::IOError)
                                 .map_err(Error::ConnectionError)?;
                             // Connection was already authenticated, everything is Ok
@@ -290,33 +334,63 @@ impl Peer {
         }
     }
 
-    // async fn auth_server() {
-    //     let tls_config = ServerConfig::builder()
-    //         .with_safe_defaults()
-    //         .with_no_client_auth()
-    //         .
-    // }
+    pub async fn auth_client(
+        self_auth: Arc<Identity>,
+        self_listen_port: u16,
+        stream: TcpStream,
+        private_key: PrivateKey,
+        cert: Certificate,
+    ) -> Result<(Arc<Identity>, u16, Connection<TlsStream<TcpStream>>), Error> {
+        let (peer_id, peer_listen_port, conn) = Self::exchange_pair(
+            self_auth, self_listen_port, stream
+        ).await?;
+        let config = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(auth::PeerVerifier::new(*peer_id))
+            .with_single_cert(vec![cert], private_key)
+            .map_err(Error::TlsError)?;
+        let config = TlsConnector::from(Arc::new(config));
+        let example_com = "example.com".try_into().unwrap();
+        let stream = config.connect(example_com, conn.into_inner()).await
+            .map_err(connection::Error::IOError)
+            .map_err(Error::ConnectionError)?;
+        let stream = tokio_rustls::TlsStream::Client(stream);
+        let conn = Connection::from_stream(stream);
+        Ok((peer_id, peer_listen_port, conn))
+    }
 
-    // async fn auth_client(
-    //     self_auth: Arc<Identity>, self_listen_port: u16, stream: TcpStream
-    // ) -> Result<(Arc<Identity>, u16, Connection<TlsStream<TcpStream>>), Error> {
-    //     let (peer_id, peer_listen_port, conn) = Self::exchange_pair(
-    //         self_auth, self_listen_port, stream
-    //     ).await?;
-    //     let crypto = rustls::ClientConfig::builder()
-    //         .with_safe_defaults()
-    //         .with_custom_certificate_verifier();
-    //     Ok(())
-    // }
+    pub async fn auth_server(
+        self_auth: Arc<Identity>,
+        self_listen_port: u16,
+        stream: TcpStream,
+        private_key: PrivateKey,
+        cert: Certificate,
+    ) -> Result<(Arc<Identity>, u16, Connection<TlsStream<TcpStream>>), Error> {
+        let (peer_id, peer_listen_port, conn) = Self::exchange_pair(
+            self_auth, self_listen_port, stream
+        ).await?;
+        let config = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_client_cert_verifier(auth::PeerVerifier::new(*peer_id))
+            .with_single_cert(vec![cert], private_key)
+            .map_err(Error::TlsError)?;
+        let config = TlsAcceptor::from(Arc::new(config));
+        let stream = config.accept(conn.into_inner()).await
+            .map_err(connection::Error::IOError)
+            .map_err(Error::ConnectionError)?;
+        let stream = tokio_rustls::TlsStream::Server(stream);
+        let conn = Connection::from_stream(stream);
+        Ok((peer_id, peer_listen_port, conn))
+    }
 
-    // #[tracing::instrument(skip(stream))]
-    pub async fn exchange_pair(
+    #[tracing::instrument(skip(stream))]
+    async fn exchange_pair(
         self_auth: Arc<Identity>, self_listen_port: u16, stream: TcpStream
     ) -> Result<(Arc<Identity>, u16, Connection<TcpStream>), Error> {
         
         let mut conn = Connection::from_stream(stream);
         // For logging only
-        let peer_addr = conn.inner_ref().peer_addr();
+        let peer_addr = conn.get_ref().peer_addr();
         tracing::trace!("Sending auth info to {:?}..", peer_addr);
 
         conn.send_message(Message::Pair(
@@ -332,7 +406,7 @@ impl Peer {
 
         let m = conn.recv_message().await
             .map_err(Error::ConnectionError)?;
-        if let connection::Message::Pair(info) = m {
+        if let Message::Pair(info) = m {
             tracing::trace!("Received auth info from {:?}!", peer_addr);
             let identity = Arc::new(info.identity);
             Ok((identity, info.listen_port, conn))
@@ -340,7 +414,7 @@ impl Peer {
         else {
             tracing::info!("Received {:?} from {:?}, but expected auth info", m, peer_addr);
             conn.send_message(
-                connection::Message::Error("Expected `AddMe` message as first one".to_string())
+                Message::Error("Expected `AddMe` message as first one".to_string())
             ).await
                 .map_err(Error::ConnectionError)?;
             Err(Error::UnexpectedMessage(m))
@@ -349,7 +423,7 @@ impl Peer {
 
     #[tracing::instrument(skip_all)]
     async fn handle_message(
-        &mut self, m: Message, conn: &mut Connection<TcpStream>
+        &mut self, m: Message, conn: &mut Connection<TlsStream<TcpStream>>
     ) -> Result<(), Error> {
         tracing::debug!("Received (from {}): {:?}", *self.peer_id, m);
         match m {
@@ -395,7 +469,7 @@ impl Peer {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn check_heartbeat(&mut self, conn: &mut Connection<TcpStream>) -> Result<(), Error> {
+    async fn check_heartbeat(&mut self, conn: &mut Connection<TlsStream<TcpStream>>) -> Result<(), Error> {
         let elapsed = self.last_active.elapsed();
         if elapsed > self.config.hb_timeout {
             // Dead
@@ -479,7 +553,9 @@ impl Peer {
 #[cfg(test)]
 mod tests {
     use tokio::net::TcpListener;
-    use tracing::{warn, Level};
+    use tracing::Level;
+    use crate::utils::{init_debugging, gen_private_key_cert};
+
     use super::*;
 
     #[derive(Debug)]
@@ -501,14 +577,15 @@ mod tests {
     }
 
     async fn test_peer(
-        stream: TcpStream,
+        conn: Connection<TlsStream<TcpStream>>,
         peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
         peer_id: Arc<Identity>,
         self_id: Arc<Identity>,
         peer_listen_port: u16,
         self_listen_port: u16,
+        self_key: PrivateKey,
+        self_cert: Certificate,
     ) -> Result<(), Error> {
-        let conn = Connection::from_stream(stream);
         let config = Config { 
             ping_period: Duration::from_secs(1),
             hb_period: Duration::from_secs(1),
@@ -518,7 +595,7 @@ mod tests {
             mpsc::channel(1).0, mpsc::channel(1).1
         );
         let peer_listen_addr = SocketAddr::new(
-            conn.inner_ref().peer_addr().map_err(Error::IOError)?.ip(), 
+            conn.get_ref().get_ref().0.peer_addr().map_err(Error::IOError)?.ip(), 
             peer_listen_port
         );
         insert_info(peer_id.clone(), peers_info.clone(), peer_listen_addr).unwrap();
@@ -536,7 +613,7 @@ mod tests {
         // tests for such stuff with these tools
         // Should timeout
         assert!(tokio::time::timeout(
-            Duration::from_secs(3),peer.handle_peer(Some(conn))
+            Duration::from_secs(3), peer.handle_peer(Some(conn), self_key, self_cert)
         ).await.is_err());
         assert_eq!(peer.get_info_copy().unwrap().status, Status::Alive);
         Ok(())
@@ -547,17 +624,28 @@ mod tests {
         peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
         peer_id: Arc<Identity>,
         self_id: Arc<Identity>,
+        self_key: PrivateKey,
+        self_cert: Certificate,
         peer_listen_port: u16,
     ) -> Result<(), Error> {
         let stream = listener.accept().await
             .map_err(Error::IOError)?;
+        let (peer_id, peer_listen_port, conn) = Peer::auth_server(
+            self_id.clone(),
+            listener.local_addr().unwrap().port(),
+            stream.0, 
+            self_key.clone(),
+            self_cert.clone()
+        ).await.unwrap();
         test_peer(
-            stream.0,
+            conn,
             peers_info,
             peer_id,
             self_id,
             peer_listen_port,
             listener.local_addr().unwrap().port(),
+            self_key,
+            self_cert,
         ).await
     }
 
@@ -566,11 +654,29 @@ mod tests {
         peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
         peer_id: Arc<Identity>,
         self_id: Arc<Identity>,
+        self_key: PrivateKey,
+        self_cert: Certificate,
         self_listen_port: u16,
     ) -> Result<(), Error> {
         let stream = TcpStream::connect(connect_to).await
             .map_err(Error::IOError)?;
-        test_peer(stream, peers_info, peer_id, self_id, connect_to.port(), self_listen_port).await
+        let (peer_id, peer_listen_port, conn) = Peer::auth_client(
+            self_id.clone(),
+            self_listen_port,
+            stream, 
+            self_key.clone(),
+            self_cert.clone()
+        ).await.unwrap();
+        test_peer(
+            conn,
+            peers_info,
+            peer_id,
+            self_id,
+            connect_to.port(),
+            self_listen_port,
+            self_key,
+            self_cert,
+        ).await
     }
 
     fn init_testing() -> 
@@ -581,29 +687,24 @@ mod tests {
         peers_info
     }
 
-    fn init_debugging() {
-        if let Err(e) = tracing_subscriber::fmt()
-            .with_max_level(Level::INFO)
-            .try_init() 
-        {
-            warn!("Couldn't init tracing_subscriber: {}", e);
-        }
-    }
-
     #[tokio::test]
     async fn two_simple_peers() {
-        init_debugging();
+        init_debugging(Level::INFO);
         let peers_info = init_testing();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
         let peer1_listen_port = listen_addr.port();
-        let peer1_id = Identity::new(b"1");
-        let peer2_id = Identity::new(b"2");
+        let (peer1_cert, peer1_key) = gen_private_key_cert();
+        let (peer2_cert, peer2_key) = gen_private_key_cert();
+        let peer1_id = Identity::new(&peer1_cert.0[..]);
+        let peer2_id = Identity::new(&peer2_cert.0[..]);
         let peer1_test = connect_test_peer(
             listen_addr,
             peers_info.clone(),
             peer2_id.clone(),
             peer1_id.clone(),
+            peer1_key.clone(),
+            peer1_cert.clone(),
             0
         );
         let peer2_test = accept_test_peer(
@@ -611,6 +712,8 @@ mod tests {
             peers_info.clone(),
             peer1_id.clone(),
             peer2_id.clone(),
+            peer2_key.clone(),
+            peer2_cert.clone(),
             peer1_listen_port,
         );
         let (res1, res2) = tokio::join!(peer1_test, peer2_test);

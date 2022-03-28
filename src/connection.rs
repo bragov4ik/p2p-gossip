@@ -1,44 +1,7 @@
-use std::{fmt::Display, net::SocketAddr};
-use serde::{Serialize, Deserialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{BytesCodec, Framed, Decoder};
 use futures::{ sink::SinkExt, stream::StreamExt };
-use crate::{peer, authentication::Identity};
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum Message {
-    Ping,
-    Heartbeat,
-    ListPeersRequest,
-    ListPeersResponse(Vec<(Identity, SocketAddr)>),
-    Pair(ConnectInfo),
-    Error(String),
-}
-
-impl Display for Message {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Message::Ping => write!(f, "Ping"),
-            Message::Heartbeat => write!(f, "Heartbeat"),
-            Message::ListPeersRequest => write!(f, "ListPeersRequest"),
-            Message::ListPeersResponse(map) => write!(f, "ListPeersResponse {:?}", map),
-            Message::Pair(add) => write!(f, "AddMe {}", add),
-            Message::Error(s) => write!(f, "Error: {}", s),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct ConnectInfo {
-    pub identity: Identity,
-    pub listen_port: u16,
-}
-
-impl Display for ConnectInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.identity)
-    }
-}
 
 #[derive(Debug)]
 pub enum Error {
@@ -91,7 +54,7 @@ where
         Ok(m)
     }
 
-    pub fn inner_ref(&self) -> &T {
+    pub fn get_ref(&self) -> &T {
         self.framed_stream.get_ref()
     }
 
@@ -103,8 +66,10 @@ where
 #[cfg(test)]
 mod tests {
     use tokio::time;
+    use crate::{utils::init_debugging, peer::Message, auth::Identity};
+
     use super::*;
-    use tracing::{debug, error, warn, info, Level};
+    use tracing::{debug, error, info, Level};
 
     #[derive(Debug, Clone, PartialEq)]
     enum Error {
@@ -197,12 +162,7 @@ mod tests {
     // Simple test
     #[test]
     fn transfer_different_types() {
-        if let Err(e) = tracing_subscriber::fmt()
-            .with_max_level(Level::INFO)
-            .try_init() 
-        {
-            warn!("Couldn't init tracing_subscriber: {}", e);
-        }
+        init_debugging(Level::INFO);
 
         info!("Running tests");
         let results = vec![
@@ -240,12 +200,8 @@ mod tests {
     // Test buffering
     #[tokio::test]
     async fn transfer_multiple_messages() {
-        if let Err(e) = tracing_subscriber::fmt()
-            .with_max_level(Level::INFO)
-            .try_init() 
-        {
-            info!("Couldn't init tracing_subscriber: {}", e);
-        }
+        init_debugging(Level::INFO);
+
         info!("Running tests");
         let tests = [
             (test_case("a".to_owned(), "b".to_owned(), 1)),

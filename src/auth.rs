@@ -1,5 +1,5 @@
 use std::{sync::Arc, collections::hash_map::DefaultHasher, hash::Hasher, fmt::Display};
-use rustls::{client::ServerCertVerified, Error};
+use rustls::{client::ServerCertVerified, Error, server::ClientCertVerified};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Serialize, Deserialize)]
@@ -37,28 +37,52 @@ impl Display for Identity {
     }
 }
 
-struct PeerVerification {
+pub struct PeerVerifier {
     peer_id: Identity,
 }
 
-impl PeerVerification {
-    fn new(peer_id: Identity) -> Arc<Self> {
+impl PeerVerifier {
+    pub fn new(peer_id: Identity) -> Arc<Self> {
         Arc::new(Self{peer_id})
     }
 }
 
-impl rustls::client::ServerCertVerifier for PeerVerification {
+impl rustls::client::ServerCertVerifier for PeerVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &rustls::Certificate,
-        intermediates: &[rustls::Certificate],
-        server_name: &rustls::ServerName,
-        scts: &mut dyn Iterator<Item = &[u8]>,
-        ocsp_response: &[u8],
-        now: std::time::SystemTime,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
     ) -> Result<ServerCertVerified, Error> {
         if self.peer_id.compare_key(&end_entity.0) {
             Ok(ServerCertVerified::assertion())
+        }
+        else {
+            Err(Error::InvalidCertificateData(
+                format!(
+                    "Certificate hash {} didn't match identity of peer {}",
+                    Identity::compute_u64(&end_entity.0), self.peer_id.as_u64())
+            ))
+        }
+    }
+}
+
+impl rustls::server::ClientCertVerifier for PeerVerifier {
+    fn client_auth_root_subjects(&self) -> Option<rustls::DistinguishedNames> {
+        Some(vec![])
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::server::ClientCertVerified, Error> {
+        if self.peer_id.compare_key(&end_entity.0) {
+            Ok(ClientCertVerified::assertion())
         }
         else {
             Err(Error::InvalidCertificateData(
