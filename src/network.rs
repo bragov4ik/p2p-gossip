@@ -1,10 +1,22 @@
+//! Gossip network
+//! 
+//! Defines entry points for starting a network node, manages handlers for each peer in the
+//! network, handles incoming connections.
+//! 
+//! # Quick start
+//! To start the network node first create `Network` with appropriate configuration:
+//! ```ignore
+//! let net = network::Network::new(identity, listen_addr, config);
+//! ```
+//! 
 use std::{collections::HashMap, sync::{Arc, Mutex}, net::SocketAddr};
 
 use tokio::{sync::mpsc, net::{TcpListener, TcpStream}};
+use tokio_rustls::{ TlsConnector, rustls::{ClientConfig, ServerConfig} };
 
 use crate::{
-    peer::{self, Config, Identity, Info, Peer, Shared},
-    connection::{self, Connection}
+    peer::{self, Config, Info, Peer, Shared},
+    connection::{self, Connection}, authentication::Identity
 };
 
 struct ConnectionNotifier {
@@ -81,7 +93,14 @@ impl Network {
         }
     }
 
-    pub async fn start(
+    fn config_tls() {
+        let mut config = ServerConfig::builder()
+            .with_safe_defaults()
+            .with_custom;
+        let connector = TlsConnector::from(Arc::new(config));
+    }
+
+    pub async fn start_listen(
         mut self,  
     ) -> std::io::Result<()> {
         tracing::debug!("Starting to listen on addr {:?}", self.listen_bind);
@@ -150,7 +169,7 @@ impl Network {
         ).await {
             tracing::error!("Could not join network through {}: {:?}", connect_addr, e);
         };
-        self.start().await?;
+        self.start_listen().await?;
         Ok(())
     }
 

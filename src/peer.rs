@@ -1,10 +1,9 @@
 use std::{net::SocketAddr, collections::HashMap, sync::{Arc, Mutex}};
 use tokio::{time::{Duration, Instant}, sync::mpsc, net::TcpStream};
+use tokio_rustls::{TlsStream, rustls::{ServerConfig, ClientConfig, RootCertStore}};
 
-use crate::connection::{self, ConnectInfo};
+use crate::{connection::{self, ConnectInfo}, authentication::Identity};
 use connection::{ Connection, Message };
-
-pub type Identity = u64;
 
 #[derive(Debug, Clone)]
 pub struct Info {
@@ -198,7 +197,7 @@ impl Peer {
                     .map_err(Error::MutexPoisoned)?;
                 let res = Self::reconnect(
                     info,
-                    (*self.peer_id).clone(),
+                    self.peer_id.clone(),
                     self.self_id.clone(),
                     self.self_listen_port,
                     &mut self.new_connections,
@@ -220,7 +219,7 @@ impl Peer {
 
     #[tracing::instrument(skip(new_connections))]
     pub async fn reconnect(
-        peer_info: Info, peer_id: u64, self_auth: Arc<Identity>, self_listen_port: u16,
+        peer_info: Info, peer_id: Arc<Identity>, self_auth: Arc<Identity>, self_listen_port: u16,
         new_connections: &mut mpsc::Receiver<(Arc<Identity>, Connection<TcpStream>)>
     ) -> Result<(Connection<TcpStream>, SocketAddr), Error> {
         loop {
@@ -238,12 +237,11 @@ impl Peer {
                             let peer_con_addr = stream.peer_addr()
                                 .map_err(connection::Error::IOError)
                                 .map_err(Error::ConnectionError)?;
-                            let mut conn = Connection::from_stream(stream);
                             match Self::exchange_pair(
-                                self_auth.clone(), self_listen_port, &mut conn
+                                self_auth.clone(), self_listen_port, stream
                             ).await {
-                                Ok((peer_id_received, peer_listen_port)) => {
-                                    if *peer_id_received == peer_id {
+                                Ok((peer_id_received, peer_listen_port, conn)) => {
+                                    if *peer_id_received == *peer_id {
                                         let mut peer_listen_addr = peer_con_addr;
                                         peer_listen_addr.set_port(peer_listen_port);
                                         return Ok((conn, peer_listen_addr))
@@ -267,7 +265,7 @@ impl Peer {
                     match receive_opt {
                         Some((peer_id_received, conn)) => {
                             // Double-check the identity, just in case
-                            if *peer_id_received != peer_id {
+                            if *peer_id_received != *peer_id {
                                 tracing::error!("Received connection with wrong identity from the
                                     network which shouldn't happen, ignoring");
                                 continue;
@@ -292,10 +290,31 @@ impl Peer {
         }
     }
 
-    #[tracing::instrument(skip(conn))]
+    // async fn auth_server() {
+    //     let tls_config = ServerConfig::builder()
+    //         .with_safe_defaults()
+    //         .with_no_client_auth()
+    //         .
+    // }
+
+    // async fn auth_client(
+    //     self_auth: Arc<Identity>, self_listen_port: u16, stream: TcpStream
+    // ) -> Result<(Arc<Identity>, u16, Connection<TlsStream<TcpStream>>), Error> {
+    //     let (peer_id, peer_listen_port, conn) = Self::exchange_pair(
+    //         self_auth, self_listen_port, stream
+    //     ).await?;
+    //     let crypto = rustls::ClientConfig::builder()
+    //         .with_safe_defaults()
+    //         .with_custom_certificate_verifier();
+    //     Ok(())
+    // }
+
+    // #[tracing::instrument(skip(stream))]
     pub async fn exchange_pair(
-        self_auth: Arc<Identity>, self_listen_port: u16, conn: &mut Connection<TcpStream>
-    ) -> Result<(Arc<Identity>, u16), Error> {
+        self_auth: Arc<Identity>, self_listen_port: u16, stream: TcpStream
+    ) -> Result<(Arc<Identity>, u16, Connection<TcpStream>), Error> {
+        
+        let mut conn = Connection::from_stream(stream);
         // For logging only
         let peer_addr = conn.inner_ref().peer_addr();
         tracing::trace!("Sending auth info to {:?}..", peer_addr);
@@ -316,7 +335,7 @@ impl Peer {
         if let connection::Message::Pair(info) = m {
             tracing::trace!("Received auth info from {:?}!", peer_addr);
             let identity = Arc::new(info.identity);
-            Ok((identity, info.listen_port))
+            Ok((identity, info.listen_port, conn))
         }
         else {
             tracing::info!("Received {:?} from {:?}, but expected auth info", m, peer_addr);
@@ -459,5 +478,143 @@ impl Peer {
 
 #[cfg(test)]
 mod tests {
+    use tokio::net::TcpListener;
+    use tracing::{warn, Level};
+    use super::*;
 
+    #[derive(Debug)]
+    enum Error {
+        IOError(std::io::Error),
+        PeerCreationError(CreationError),
+    }
+
+    fn insert_info(
+        peer_id: Arc<Identity>,
+        peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
+        peer_listen_addr: SocketAddr,
+    ) -> Result<Option<Shared<Info>>, super::MutexPoisoned> {
+        let mut info_map = peers_info.lock()
+            .map_err(|_| {super::MutexPoisoned{}})?;
+        let new_info = Arc::new(Mutex::new(Info::new(peer_listen_addr)));
+        tracing::debug!("Updated successfully");
+        Ok(info_map.insert(peer_id, new_info))
+    }
+
+    async fn test_peer(
+        stream: TcpStream,
+        peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
+        peer_id: Arc<Identity>,
+        self_id: Arc<Identity>,
+        peer_listen_port: u16,
+        self_listen_port: u16,
+    ) -> Result<(), Error> {
+        let conn = Connection::from_stream(stream);
+        let config = Config { 
+            ping_period: Duration::from_secs(1),
+            hb_period: Duration::from_secs(1),
+            hb_timeout: Duration::from_secs(3) 
+        };
+        let stub_channels = (
+            mpsc::channel(1).0, mpsc::channel(1).1
+        );
+        let peer_listen_addr = SocketAddr::new(
+            conn.inner_ref().peer_addr().map_err(Error::IOError)?.ip(), 
+            peer_listen_port
+        );
+        insert_info(peer_id.clone(), peers_info.clone(), peer_listen_addr).unwrap();
+        let mut peer = Peer::new(
+            peers_info,
+            config,
+            peer_id,
+            self_listen_port,
+            self_id,
+            stub_channels.1,
+            stub_channels.0
+        ).map_err(Error::PeerCreationError)?;
+
+        // For now wait and check if they see each other as alive hard to come up with automated
+        // tests for such stuff with these tools
+        // Should timeout
+        assert!(tokio::time::timeout(
+            Duration::from_secs(3),peer.handle_peer(Some(conn))
+        ).await.is_err());
+        assert_eq!(peer.get_info_copy().unwrap().status, Status::Alive);
+        Ok(())
+    }
+
+    async fn accept_test_peer(
+        listener: TcpListener,
+        peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
+        peer_id: Arc<Identity>,
+        self_id: Arc<Identity>,
+        peer_listen_port: u16,
+    ) -> Result<(), Error> {
+        let stream = listener.accept().await
+            .map_err(Error::IOError)?;
+        test_peer(
+            stream.0,
+            peers_info,
+            peer_id,
+            self_id,
+            peer_listen_port,
+            listener.local_addr().unwrap().port(),
+        ).await
+    }
+
+    async fn connect_test_peer(
+        connect_to: SocketAddr,
+        peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
+        peer_id: Arc<Identity>,
+        self_id: Arc<Identity>,
+        self_listen_port: u16,
+    ) -> Result<(), Error> {
+        let stream = TcpStream::connect(connect_to).await
+            .map_err(Error::IOError)?;
+        test_peer(stream, peers_info, peer_id, self_id, connect_to.port(), self_listen_port).await
+    }
+
+    fn init_testing() -> 
+        Shared<HashMap<Arc<Identity>, Shared<Info>>>
+    {
+        let peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>> = 
+            Arc::new(Mutex::new(HashMap::new()));
+        peers_info
+    }
+
+    fn init_debugging() {
+        if let Err(e) = tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .try_init() 
+        {
+            warn!("Couldn't init tracing_subscriber: {}", e);
+        }
+    }
+
+    #[tokio::test]
+    async fn two_simple_peers() {
+        init_debugging();
+        let peers_info = init_testing();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let peer1_listen_port = listen_addr.port();
+        let peer1_id = Identity::new(b"1");
+        let peer2_id = Identity::new(b"2");
+        let peer1_test = connect_test_peer(
+            listen_addr,
+            peers_info.clone(),
+            peer2_id.clone(),
+            peer1_id.clone(),
+            0
+        );
+        let peer2_test = accept_test_peer(
+            listener,
+            peers_info.clone(),
+            peer1_id.clone(),
+            peer2_id.clone(),
+            peer1_listen_port,
+        );
+        let (res1, res2) = tokio::join!(peer1_test, peer2_test);
+        res1.unwrap();
+        res2.unwrap();
+    }
 }

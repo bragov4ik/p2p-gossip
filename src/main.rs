@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
+use authentication::Identity;
 use tokio::time::Duration;
 use clap::Parser;
 
 mod connection;
 mod peer;
 mod network;
+mod authentication;
 
 #[derive(Parser)]
 #[clap(author, version, about)]
@@ -15,8 +17,8 @@ struct Args {
     port: u16,
     #[clap(long)]
     connect: Option<SocketAddr>,
-    #[clap(long)]
-    id: Option<peer::Identity>,
+    // #[clap(long)]
+    // id: Option<Identity>,
 }
 
 #[tokio::main]
@@ -26,10 +28,10 @@ async fn main() {
 
     // Application configuration
     let args = Args::parse();
-    let identity = match args.id {
-        Some(id) => id,
-        None => rand::random::<u64>(),
-    };
+    // let identity = match args.id { TODO generate/import
+    //     Some(id) => id,
+    //     None => rand::random::<u64>(),
+    // };
     let listen_addr = SocketAddr::new("0.0.0.0".parse().unwrap(), args.port);
     let config = peer::Config{
         ping_period: Duration::from_secs(args.period),
@@ -48,7 +50,7 @@ async fn main() {
             net.start_connect(remote_addr).await
         },
         None => {
-            net.start().await
+            net.start_listen().await
         },
     };
     match res {

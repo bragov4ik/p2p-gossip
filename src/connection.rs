@@ -3,7 +3,7 @@ use serde::{Serialize, Deserialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{BytesCodec, Framed, Decoder};
 use futures::{ sink::SinkExt, stream::StreamExt };
-use crate::peer::{self, Identity};
+use crate::{peer, authentication::Identity};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Message {
@@ -30,7 +30,7 @@ impl Display for Message {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ConnectInfo {
-    pub identity: peer::Identity,
+    pub identity: Identity,
     pub listen_port: u16,
 }
 
@@ -93,6 +93,10 @@ where
 
     pub fn inner_ref(&self) -> &T {
         self.framed_stream.get_ref()
+    }
+
+    pub fn into_inner(self) -> T {
+        self.framed_stream.into_inner()
     }
 }
 
@@ -209,8 +213,8 @@ mod tests {
             run_one(
                 Message::ListPeersRequest,
                 Message::ListPeersResponse(vec![
-                    (1, "127.0.0.1:8080".parse().unwrap()),
-                    (2, "127.0.0.2:5050".parse().unwrap())
+                    (*Identity::new(b"1"), "127.0.0.1:8080".parse().unwrap()),
+                    (*Identity::new(b"2"), "127.0.0.2:5050".parse().unwrap())
                 ])
             ),
         ];
