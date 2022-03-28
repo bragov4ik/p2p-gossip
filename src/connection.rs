@@ -5,24 +5,22 @@ use tokio_util::codec::{BytesCodec, Decoder, Framed};
 
 #[derive(Debug)]
 pub enum Error {
-    SerializationError(bincode::Error),
-    IOError(std::io::Error),
+    Serialization(bincode::Error),
+    IO(std::io::Error),
     StreamEnded,
 }
 
 #[derive(Debug)]
 pub struct Connection<T>
-where
-    T: AsyncRead + AsyncWrite + Sized + std::marker::Unpin + std::fmt::Debug,
 {
     framed_stream: Framed<T, BytesCodec>,
 }
 
 impl<T> Connection<T>
-where
-    T: AsyncRead + AsyncWrite + Sized + std::marker::Unpin + std::fmt::Debug,
 {
-    pub fn from_stream(stream: T) -> Self {
+    pub fn from_stream(stream: T) -> Self 
+    where
+        T: AsyncRead + AsyncWrite + Sized {
         let framed_stream = BytesCodec::new().framed(stream);
         Connection { framed_stream }
     }
@@ -31,13 +29,14 @@ where
     pub async fn send_message<M>(&mut self, m: M) -> Result<(), Error>
     where
         M: Serialize + std::fmt::Debug,
+        T: AsyncRead + AsyncWrite + Sized + std::marker::Unpin + std::fmt::Debug,
     {
-        let bytes = bincode::serialize(&m).map_err(Error::SerializationError)?;
+        let bytes = bincode::serialize(&m).map_err(Error::Serialization)?;
         let bytes = bytes::Bytes::from(bytes);
         self.framed_stream
             .send(bytes)
             .await
-            .map_err(Error::IOError)?;
+            .map_err(Error::IO)?;
         Ok(())
     }
 
@@ -45,14 +44,15 @@ where
     pub async fn recv_message<M>(&mut self) -> Result<M, Error>
     where
         M: DeserializeOwned + std::fmt::Debug,
+        T: AsyncRead + AsyncWrite + Sized + std::marker::Unpin + std::fmt::Debug,
     {
         let result = match self.framed_stream.next().await {
             Some(v) => v,
             None => return Err(Error::StreamEnded),
         };
-        let bytes = result.map_err(Error::IOError)?;
+        let bytes = result.map_err(Error::IO)?;
         let bytes = &bytes[..];
-        let m = bincode::deserialize(bytes).map_err(Error::SerializationError)?;
+        let m = bincode::deserialize(bytes).map_err(Error::Serialization)?;
         Ok(m)
     }
 
@@ -77,7 +77,7 @@ mod tests {
     enum Error {
         TimedOut,
         UnexpectedMessage(String),
-        ConnectionError(String),
+        Connection(String),
     }
 
     /// Sends `to_send` and expects `expect_recv` back `repeat` times.
@@ -96,12 +96,12 @@ mod tests {
             debug!("Sending message {}", _i);
             conn.send_message(to_send.clone())
                 .await
-                .map_err(|e| Error::ConnectionError(format!("{:?}", e)))?;
+                .map_err(|e| Error::Connection(format!("{:?}", e)))?;
             debug!("Receiving message {}", _i);
             let received: M = conn
                 .recv_message()
                 .await
-                .map_err(|e| Error::ConnectionError(format!("{:?}", e)))?;
+                .map_err(|e| Error::Connection(format!("{:?}", e)))?;
             if received != expect_recv {
                 return Err(Error::UnexpectedMessage(format!(
                     "Unexpected message received: {:?}, expected {:?}",
@@ -137,8 +137,8 @@ mod tests {
         // Report timeouts
         let c_res = c_res.map_err(|_| Error::TimedOut);
         let s_res = s_res.map_err(|_| Error::TimedOut);
-        let c_res = c_res.clone().and_then(|x| x);
-        let s_res = s_res.clone().and_then(|x| x);
+        let c_res = c_res.and_then(|x| x);
+        let s_res = s_res.and_then(|x| x);
         c_res.and(s_res).map(|a| {
             debug!("Transfers completed!");
             debug!("Test completed!");
@@ -169,8 +169,8 @@ mod tests {
             run_one(
                 Message::ListPeersRequest,
                 Message::ListPeersResponse(vec![
-                    (*Identity::new(b"1"), "127.0.0.1:8080".parse().unwrap()),
-                    (*Identity::new(b"2"), "127.0.0.2:5050".parse().unwrap()),
+                    ((*Identity::new(b"1")).clone(), "127.0.0.1:8080".parse().unwrap()),
+                    ((*Identity::new(b"2")).clone(), "127.0.0.2:5050".parse().unwrap()),
                 ]),
             ),
         ];
@@ -183,12 +183,12 @@ mod tests {
             }
         }
         if failed {
-            assert!(false);
+            panic!();
         }
     }
 
     // Thanks https://stackoverflow.com/a/58175659
-    fn do_vecs_match<T: PartialEq>(a: &Vec<T>, b: &Vec<T>) -> bool {
+    fn do_vecs_match<T: PartialEq>(a: &[T], b: &[T]) -> bool {
         let matching = a.iter().zip(b.iter()).filter(|&(a, b)| a == b).count();
         matching == a.len() && matching == b.len()
     }
@@ -211,7 +211,7 @@ mod tests {
             }
         }
         assert!(do_vecs_match(
-            &results.iter().cloned().collect::<Vec<Result<(), Error>>>(),
+            &results.to_vec(),
             &results_expected
         ));
     }

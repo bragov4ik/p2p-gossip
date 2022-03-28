@@ -4,12 +4,14 @@
 //! network, handles incoming connections.
 //!
 //! # Quick start
-//! To start the network node first create `Network` with appropriate configuration:
 //! ```ignore
 //! let net = network::Network::new(
 //!     private_key, cert, listen_addr, config
 //! );
+//! net.start_listen()
 //! ```
+//! To start the network node first create `Network` with appropriate configuration, then
+//! use either [`Network::start_listen()`] or [`Network::start_listen()`].
 //!
 use std::{
     collections::HashMap,
@@ -28,7 +30,7 @@ use crate::{
     auth::Identity,
     connection::{self, Connection},
     peer::{self, Config, Info, Peer},
-    utils::{MutexPoisoned, Shared},
+    utils::MutexPoisoned,
 };
 
 struct ConnectionNotifier {
@@ -38,8 +40,8 @@ struct ConnectionNotifier {
 impl ConnectionNotifier {
     /// Create peer with associated notifier
     /// must insert info about this peer in `peers_info`
-    pub fn peer_notifier(
-        peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
+    fn peer_notifier(
+        peers_info: Arc<Mutex<PeerInfoMap>>,
         config: Config,
         peer_id: Arc<Identity>,
         self_listen_port: u16,
@@ -65,7 +67,7 @@ impl ConnectionNotifier {
         ))
     }
 
-    pub async fn notify_new_connection(
+    async fn notify_new_connection(
         &mut self,
         id: Arc<Identity>,
         conn: Connection<TlsStream<TcpStream>>,
@@ -73,9 +75,11 @@ impl ConnectionNotifier {
         self.new_connections_sender
             .send((id, conn))
             .await
-            .map_err(Error::MpscSendAddrError)
+            .map_err(Error::MpscSendAddr)
     }
 }
+
+pub type PeerInfoMap = HashMap<Arc<Identity>, Arc<Mutex<Info>>>;
 
 pub struct Network {
     peer_config: Config,
@@ -87,7 +91,7 @@ pub struct Network {
     listen_bind: SocketAddr,
 
     // Should be consistent with notifiers
-    peers_info: Shared<HashMap<Arc<Identity>, Shared<Info>>>,
+    peers_info: Arc<Mutex<PeerInfoMap>>,
 
     // If a connection for some peer was established, it is sent through the corresponding notifier
     notifiers: HashMap<Arc<Identity>, ConnectionNotifier>,
@@ -102,10 +106,10 @@ pub struct Network {
 
 #[derive(Debug)]
 pub enum Error {
-    PeerError(peer::Error),
-    PeerCreationError(peer::CreationError),
-    MpscSendAddrError(mpsc::error::SendError<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>),
-    MpscSendPeerError(mpsc::error::SendError<(Peer, Option<Connection<TlsStream<TcpStream>>>)>),
+    Peer(peer::Error),
+    PeerCreation(peer::CreationError),
+    MpscSendAddr(mpsc::error::SendError<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>),
+    MpscSendPeer(mpsc::error::SendError<(Peer, Option<Connection<TlsStream<TcpStream>>>)>),
 }
 
 impl Network {
@@ -141,35 +145,38 @@ impl Network {
         tracing::debug!("Starting to listen on addr {:?}", self.listen_bind);
         let listener = TcpListener::bind(self.listen_bind).await?;
         loop {
-            let new_peer = self.new_peers_receiver.recv();
-            let new_auth = self.new_auth_addr_receiver.recv();
             tokio::select! {
                 listen_res = listener.accept() => {
-                    match listen_res {
+                    let stream = match listen_res {
                         Ok((stream, _addr)) => {
-                            tracing::debug!("New incoming connection from {:?}", stream.peer_addr());
-                            if let Err(Error::PeerError(e)) = self.handle_new_con(
-                                stream, self.peer_config.clone(), true
-                            ).await {
-                                match e {
-                                    peer::Error::ConnectionError(_) | peer::Error::TlsError(_) |
-                                    peer::Error::UnexpectedMessage(_) => tracing::warn!("{:?}", e),
-                                    peer::Error::MutexPoisoned(_) => {
-                                        tracing::error!("Some mutex was poisoned, unable to continue");
-                                        return Ok(())
-                                    },
-                                    peer::Error::ChannelClosed(s) => {
-                                        tracing::error!("Channel {} was closed,
-                                            peer can't be handled without it", s);
-                                        return Ok(())
-                                    }
-                                }
-                            };
+                            stream
                         },
-                        Err(e) => tracing::warn!("Couldn't accept incoming connection: {}", e),
+                        Err(e) => {
+                            tracing::warn!("Couldn't accept incoming connection: {}", e);
+                            continue;
+                        },
                     };
+                    tracing::debug!("New incoming connection from {:?}", stream.peer_addr());
+                    let handle_new_con_res = self.handle_new_con(
+                        stream, self.peer_config.clone(), true
+                    ).await;
+                    match handle_new_con_res {
+                        Err(Error::Peer(peer::Error::Connection(_) | peer::Error::Tls(_) |
+                        peer::Error::UnexpectedMessage(_))) => tracing::warn!("{:?}", handle_new_con_res),
+                        Err(Error::Peer(peer::Error::MutexPoisoned(_))) => {
+                            tracing::error!("Some mutex was poisoned, unable to continue");
+                            return Ok(())
+                        },
+                        Err(Error::Peer(peer::Error::ChannelClosed(s))) => {
+                            tracing::error!("Channel {} was closed,
+                                peer can't be handled without it", s);
+                            return Ok(())
+                        }
+                        Err(_) => tracing::warn!("{:?}", handle_new_con_res),
+                        Ok(_) => (),
+                    }
                 }
-                auth_opt = new_auth => {
+                auth_opt = self.new_auth_addr_receiver.recv() => {
                     match auth_opt {
                         Some((peer_id, peer_listen_addr)) => {
                             if let Err(e) = self.add_to_network(
@@ -181,7 +188,7 @@ impl Network {
                         None => tracing::error!("New auth was closed unexpectedly, can't work properly"),
                     }
                 }
-                peer_opt = new_peer => {
+                peer_opt = self.new_peers_receiver.recv() => {
                     match peer_opt {
                         Some((mut peer, conn)) => {
                             let self_private_key = self.self_private_key.clone();
@@ -227,9 +234,9 @@ impl Network {
     ) -> Result<(), Error> {
         let peer_con_addr = stream
             .peer_addr()
-            .map_err(connection::Error::IOError)
-            .map_err(peer::Error::ConnectionError)
-            .map_err(Error::PeerError)?;
+            .map_err(connection::Error::IO)
+            .map_err(peer::Error::Connection)
+            .map_err(Error::Peer)?;
         let (peer_id, peer_listen_port, conn) = match incoming {
             true => peer::Peer::auth_server(
                 self.self_id.clone(),
@@ -239,7 +246,7 @@ impl Network {
                 self.self_cert.clone(),
             )
             .await
-            .map_err(Error::PeerError)?,
+            .map_err(Error::Peer)?,
             false => peer::Peer::auth_new_client(
                 self.self_id.clone(),
                 self.listen_bind.port(),
@@ -248,7 +255,7 @@ impl Network {
                 self.self_cert.clone(),
             )
             .await
-            .map_err(Error::PeerError)?,
+            .map_err(Error::Peer)?,
         };
         let peer_listen_addr = SocketAddr::new(peer_con_addr.ip(), peer_listen_port);
         self.add_to_network(peer_id, peer_listen_addr, peer_config, Some(conn))
@@ -281,7 +288,7 @@ impl Network {
                         behaviour."
                     ),
                     Ok(None) => (),
-                    Err(e) => return Err(Error::PeerError(peer::Error::MutexPoisoned(e))),
+                    Err(e) => return Err(Error::Peer(peer::Error::MutexPoisoned(e))),
                 }
                 tracing::debug!("Sending new connection to handler");
                 let notifier = self
@@ -301,7 +308,7 @@ impl Network {
                     behaviour."
                 ),
                 Ok(None) => tracing::debug!("Successfully added new peer's info"),
-                Err(e) => return Err(Error::PeerError(peer::Error::MutexPoisoned(e))),
+                Err(e) => return Err(Error::Peer(peer::Error::MutexPoisoned(e))),
             }
             let (peer, notifier) = ConnectionNotifier::peer_notifier(
                 self.peers_info.clone(),
@@ -311,13 +318,13 @@ impl Network {
                 self.self_id.clone(),
                 self.new_auth_addr_sender.clone(),
             )
-            .map_err(Error::PeerCreationError)?;
+            .map_err(Error::PeerCreation)?;
             self.notifiers.insert(peer_id, notifier);
             tracing::debug!("Scheduling the handler for execution");
             self.new_peers_sender
                 .send((peer, conn_opt))
                 .await
-                .map_err(Error::MpscSendPeerError)?;
+                .map_err(Error::MpscSendPeer)?;
         }
         Ok(())
     }
@@ -327,7 +334,7 @@ impl Network {
         &mut self,
         peer_identity: Arc<Identity>,
         peer_listen_addr: SocketAddr,
-    ) -> Result<Option<Shared<Info>>, MutexPoisoned> {
+    ) -> Result<Option<Arc<Mutex<Info>>>, MutexPoisoned> {
         tracing::debug!("Updating listen address");
         let mut info_map = self.peers_info.lock().map_err(|_| MutexPoisoned {})?;
         let new_info = Arc::new(Mutex::new(Info::new(peer_listen_addr)));

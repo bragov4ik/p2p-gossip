@@ -1,12 +1,8 @@
-use std::sync::{Arc, Mutex};
-
 use rustls::{Certificate, PrivateKey};
 use tracing::Level;
 
 #[derive(Debug)]
 pub struct MutexPoisoned {}
-
-pub type Shared<T> = Arc<Mutex<T>>;
 
 pub fn gen_private_key_cert() -> (Certificate, PrivateKey) {
     let gen = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();

@@ -51,21 +51,15 @@ fn get_private_key_cert(
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
 ) -> std::io::Result<Option<(Certificate, PrivateKey)>> {
-    match cert_path {
-        Some(cp) => match key_path {
-            Some(kp) => {
-                let cert = read_cert(&cp)?;
-                let key = read_private_key(&kp)?;
-                if let (Some(k), Some(c)) = (key, cert) {
-                    tracing::debug!("Read key/cert successfully!");
-                    return Ok(Some((c, k)));
-                } else {
-                    return Ok(None);
-                }
-            }
-            None => (),
-        },
-        None => (),
+    if let (Some(cp), Some(kp)) = (cert_path, key_path) {
+        let cert = read_cert(&cp)?;
+        let key = read_private_key(&kp)?;
+        if let (Some(k), Some(c)) = (key, cert) {
+            tracing::debug!("Read key/cert successfully!");
+            return Ok(Some((c, k)));
+        } else {
+            return Ok(None);
+        }
     }
     tracing::debug!("Saved key/cert not found, generating new");
     Ok(Some(gen_private_key_cert()))

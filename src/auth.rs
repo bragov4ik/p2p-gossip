@@ -2,7 +2,7 @@ use rustls::{client::ServerCertVerified, server::ClientCertVerified, Error};
 use serde::{Deserialize, Serialize};
 use std::{collections::hash_map::DefaultHasher, fmt::Display, hash::Hasher, sync::Arc};
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash, Serialize, Deserialize)]
 pub struct Identity {
     pubkey_hash: u64,
 }
@@ -22,7 +22,7 @@ impl Identity {
     }
 
     pub fn as_u64(&self) -> u64 {
-        return self.pubkey_hash;
+        self.pubkey_hash
     }
 
     pub fn compare_key(&self, pubkey: &[u8]) -> bool {
