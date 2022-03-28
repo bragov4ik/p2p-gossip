@@ -105,7 +105,7 @@ pub struct Peer {
     self_id: Arc<Identity>,
 
     // New connections to the peer, if received on listen port
-    new_connections: mpsc::Receiver<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>,
+    new_connections: mpsc::Receiver<Connection<TlsStream<TcpStream>>>,
 
     // Notifications to network about new discovered peers
     new_auth_addr: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
@@ -142,7 +142,7 @@ impl Peer {
         peer_id: Arc<Identity>,
         self_listen_port: u16,
         self_id: Arc<Identity>,
-        new_connections: mpsc::Receiver<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>,
+        new_connections: mpsc::Receiver<Connection<TlsStream<TcpStream>>>,
         new_auth_addr: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
     ) -> Result<Self, CreationError> {
         let peer_info = {
@@ -279,7 +279,7 @@ impl Peer {
         self_listen_port: u16,
         self_private_key: PrivateKey,
         self_cert: Certificate,
-        new_connections: &mut mpsc::Receiver<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>,
+        new_connections: &mut mpsc::Receiver<Connection<TlsStream<TcpStream>>>,
     ) -> Result<(Connection<TlsStream<TcpStream>>, SocketAddr), Error> {
         loop {
             let peer_listen_addr = peer_info.last_address;
@@ -321,13 +321,7 @@ impl Peer {
                 },
                 receive_opt = new_connections.recv() => {
                     match receive_opt {
-                        Some((peer_id_received, conn)) => {
-                            // Double-check the identity, just in case
-                            if *peer_id_received != *peer_id {
-                                tracing::error!("Received connection with wrong identity from the
-                                    network which shouldn't happen, ignoring");
-                                continue;
-                            }
+                        Some(conn) => {
                             let peer_addr = conn.get_ref().get_ref().0.peer_addr()
                                 .map_err(connection::Error::IO)
                                 .map_err(Error::Connection)?;

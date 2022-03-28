@@ -2,17 +2,16 @@
 //!
 //! Defines entry points for starting a network node, manages handlers for each peer in the
 //! network, handles incoming connections.
+//! 
+//! To be more precise, its responsibilites include
+//! * Directing connections to existing handlers
+//! * Creating handlers if needed
+//! * Communication with not authenticated handlers (i.e. without defined [`Identity`])
+//! 
+//! If there is a confirmed identity, communication is delegated to [`Peer`].
 //!
-//! # Quick start
-//! ```ignore
-//! let net = network::Network::new(
-//!     private_key, cert, listen_addr, config
-//! );
-//! net.start_listen()
-//! ```
-//! To start the network node first create `Network` with appropriate configuration, then
+//! To start the network node first create [`Network`] with appropriate configuration, then
 //! use either [`Network::start_listen()`] or [`Network::start_listen()`].
-//!
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -33,13 +32,14 @@ use crate::{
     utils::MutexPoisoned,
 };
 
+/// Convenient peer notifier about new established connections to it
 struct ConnectionNotifier {
-    new_connections_sender: mpsc::Sender<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>,
+    new_connections_sender: mpsc::Sender<Connection<TlsStream<TcpStream>>>,
 }
 
 impl ConnectionNotifier {
-    /// Create peer with associated notifier
-    /// must insert info about this peer in `peers_info`
+    /// Create peer handler with associated notifier.
+    /// Caller must insert info about this peer in `peers_info` beforehand.
     fn peer_notifier(
         peers_info: Arc<Mutex<PeerInfoMap>>,
         config: Config,
@@ -48,7 +48,7 @@ impl ConnectionNotifier {
         self_id: Arc<Identity>,
         new_auth_addr: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
     ) -> Result<(Peer, Self), peer::CreationError> {
-        // TODO config the number
+        // 32 should be enough, maybe move to some config file later
         let (new_connections_sender, new_connections) = mpsc::channel(32);
         let peer = Peer::new(
             peers_info,
@@ -67,13 +67,13 @@ impl ConnectionNotifier {
         ))
     }
 
+    /// Send notification to the peer handler about a new connection
     async fn notify_new_connection(
         &mut self,
-        id: Arc<Identity>,
         conn: Connection<TlsStream<TcpStream>>,
     ) -> Result<(), Error> {
         self.new_connections_sender
-            .send((id, conn))
+            .send(conn)
             .await
             .map_err(Error::MpscSendAddr)
     }
@@ -82,20 +82,23 @@ impl ConnectionNotifier {
 pub type PeerInfoMap = HashMap<Arc<Identity>, Arc<Mutex<Info>>>;
 
 pub struct Network {
+    // Behaviour of peer handler
     peer_config: Config,
-
+    
     self_private_key: PrivateKey,
     self_cert: Certificate,
 
     self_id: Arc<Identity>,
+
     listen_bind: SocketAddr,
 
-    // Should be consistent with notifiers
+    // All known peers' information. Should be consistent with `notifiers`
     peers_info: Arc<Mutex<PeerInfoMap>>,
 
-    // If a connection for some peer was established, it is sent through the corresponding notifier
+    // Notifiers for sending connections to existing handlers
     notifiers: HashMap<Arc<Identity>, ConnectionNotifier>,
 
+    // Handles for obtaining info of peers discovered from others' peer lists
     new_auth_addr_receiver: mpsc::Receiver<(Arc<Identity>, SocketAddr)>,
     new_auth_addr_sender: mpsc::Sender<(Arc<Identity>, SocketAddr)>,
 
@@ -108,7 +111,7 @@ pub struct Network {
 pub enum Error {
     Peer(peer::Error),
     PeerCreation(peer::CreationError),
-    MpscSendAddr(mpsc::error::SendError<(Arc<Identity>, Connection<TlsStream<TcpStream>>)>),
+    MpscSendAddr(mpsc::error::SendError<Connection<TlsStream<TcpStream>>>),
     MpscSendPeer(mpsc::error::SendError<(Peer, Option<Connection<TlsStream<TcpStream>>>)>),
 }
 
@@ -120,7 +123,7 @@ impl Network {
         peer_config: Config,
     ) -> Self {
         let peers_info = Arc::new(Mutex::new(HashMap::new()));
-        // Ensure immutability and avoid copying if it grows later
+        // Ensure immutability and avoid copying if it is changed later
         let self_id = Identity::new(&self_cert.0[..]);
         let notifiers = HashMap::new();
         // TODO config the numbers
@@ -295,7 +298,7 @@ impl Network {
                     .notifiers
                     .get_mut(&peer_id)
                     .expect("Key disappeared right after checking for contains_key, very strange");
-                notifier.notify_new_connection(peer_id, conn).await?;
+                notifier.notify_new_connection(conn).await?;
             } else {
                 tracing::debug!("No connection was provieded, ignoring");
             }
