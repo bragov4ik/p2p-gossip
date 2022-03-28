@@ -154,6 +154,7 @@ impl Network {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, fields(peer_addr=?stream.peer_addr().map(|a| a.to_string())))]
     async fn handle_new_con(
         &mut self, stream: TcpStream, peer_config: Config
     ) -> Result<(), Error> {
@@ -173,6 +174,7 @@ impl Network {
 
     /// Based on the identity either send Peer the connection or add a new peer handler
     /// peer_addr - address at which peer's listener's at
+    #[tracing::instrument(skip(self, peer_listen_addr, peer_config, conn_opt), fields(peer_listen_addr=%peer_listen_addr))]
     async fn add_to_network(
         &mut self,
         peer_id: Arc<Identity>,
@@ -180,13 +182,13 @@ impl Network {
         peer_config: Config,
         conn_opt: Option<Connection<TcpStream>>
     ) -> Result<(), Error> {
-        tracing::debug!("Adding peer (auth {:?}, connection {:?}) to network", peer_id, conn_opt);
+        tracing::debug!("Adding peer to network");
         if peer_id == self.self_id {
             tracing::debug!("Trying to add myself to the network, aborting");
             return Ok(());
         }
         if self.notifiers.contains_key(&peer_id) {
-            tracing::debug!("Peer {} is already known", peer_id);
+            tracing::debug!("Peer is already known");
             if let Some(conn) = conn_opt {
                 match self.insert_info(peer_id.clone(), peer_listen_addr) {
                     Ok(Some(_)) => tracing::warn!("Inconsistency between `notifiers` and `peers_info`\
@@ -207,12 +209,12 @@ impl Network {
             }
         }
         else {
-            tracing::debug!("Peer {} is unknown, creating a new handler", &peer_id);
+            tracing::debug!("Peer is unknown, creating a new handler");
             match self.insert_info(peer_id.clone(), peer_listen_addr) {
                 Ok(Some(_)) => tracing::warn!("Inconsistency between `notifiers` and `peers_info`\
                     which probably happened from some previous error, this may lead to wrong \
                     behaviour."),
-                Ok(None) => tracing::trace!("Successfully added new peer's info"),
+                Ok(None) => tracing::debug!("Successfully added new peer's info"),
                 Err(e) =>
                     return Err(Error::PeerError(peer::Error::MutexPoisoned(e))),
             }
@@ -228,19 +230,20 @@ impl Network {
                 peer_id,
                 notifier
             );
-            tracing::trace!("Scheduling the handler for execution");
+            tracing::debug!("Scheduling the handler for execution");
             self.new_peers_sender.send((peer, conn_opt)).await
                 .map_err(Error::MpscSendPeerError)?;
         }
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, peer_listen_addr), fields(peer_listen_addr=%peer_listen_addr))]
     fn insert_info(
         &mut self,
         peer_identity: Arc<Identity>,
         peer_listen_addr: SocketAddr,
     ) -> Result<Option<Shared<Info>>, peer::MutexPoisoned> {
-        tracing::debug!("Updating {}'s listen address to {}", peer_identity, peer_listen_addr);
+        tracing::debug!("Updating listen address");
         let mut info_map = self.peers_info.lock()
             .map_err(|_| {peer::MutexPoisoned{}})?;
         let new_info = Arc::new(Mutex::new(Info::new(peer_listen_addr)));

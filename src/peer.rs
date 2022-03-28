@@ -120,6 +120,7 @@ impl Peer {
 
     // Handle communication with a particular peer through a connection (if any)
     // tries to connect if no connection given
+    #[tracing::instrument(skip_all)]
     pub async fn handle_peer(&mut self, mut conn_opt: Option<Connection<TcpStream>>,) -> Result<(), Error>{
         use tokio::time::interval;
 
@@ -217,6 +218,7 @@ impl Peer {
         }
     }
 
+    #[tracing::instrument(skip(new_connections))]
     pub async fn reconnect(
         peer_info: Info, peer_id: u64, self_auth: Arc<Identity>, self_listen_port: u16,
         new_connections: &mut mpsc::Receiver<(Arc<Identity>, Connection<TcpStream>)>
@@ -290,6 +292,7 @@ impl Peer {
         }
     }
 
+    #[tracing::instrument(skip(conn))]
     pub async fn exchange_pair(
         self_auth: Arc<Identity>, self_listen_port: u16, conn: &mut Connection<TcpStream>
     ) -> Result<(Arc<Identity>, u16), Error> {
@@ -325,6 +328,7 @@ impl Peer {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     async fn handle_message(
         &mut self, m: Message, conn: &mut Connection<TcpStream>
     ) -> Result<(), Error> {
@@ -371,6 +375,7 @@ impl Peer {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all)]
     async fn check_heartbeat(&mut self, conn: &mut Connection<TcpStream>) -> Result<(), Error> {
         let elapsed = self.last_active.elapsed();
         if elapsed > self.config.hb_timeout {
@@ -444,6 +449,7 @@ impl Peer {
         Ok(())
     }
 
+    // same
     fn get_listen_addr(&self) -> Result<SocketAddr, MutexPoisoned> {
         let info = self.peer_info.lock()
             .map_err(|_| {MutexPoisoned{}})?;
@@ -451,3 +457,7 @@ impl Peer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+
+}
