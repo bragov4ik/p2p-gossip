@@ -1,22 +1,27 @@
-use std::{net::SocketAddr, path::{PathBuf, Path}, io::BufReader, fs::File};
-use rustls::{PrivateKey, Certificate};
-use tokio::time::Duration;
 use clap::Parser;
+use rustls::{Certificate, PrivateKey};
+use std::{
+    fs::File,
+    io::BufReader,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
+use tokio::time::Duration;
 
 use crate::utils::gen_private_key_cert;
 
-mod connection;
-mod peer;
-mod network;
 mod auth;
+mod connection;
+mod network;
+mod peer;
 mod utils;
 
 #[derive(Parser)]
 #[clap(author, version, about)]
 struct Args {
-    #[clap(long, default_value="5")]
+    #[clap(long, default_value = "5")]
     period: u64,
-    #[clap(long, default_value="8080")]
+    #[clap(long, default_value = "8080")]
     port: u16,
     #[clap(long)]
     connect: Option<SocketAddr>,
@@ -43,7 +48,8 @@ fn read_private_key(key_path: &Path) -> std::io::Result<Option<PrivateKey>> {
 }
 
 fn get_private_key_cert(
-    cert_path: Option<PathBuf>, key_path: Option<PathBuf>
+    cert_path: Option<PathBuf>,
+    key_path: Option<PathBuf>,
 ) -> std::io::Result<Option<(Certificate, PrivateKey)>> {
     match cert_path {
         Some(cp) => match key_path {
@@ -52,14 +58,13 @@ fn get_private_key_cert(
                 let key = read_private_key(&kp)?;
                 if let (Some(k), Some(c)) = (key, cert) {
                     tracing::debug!("Read key/cert successfully!");
-                    return Ok(Some((c, k)))
+                    return Ok(Some((c, k)));
+                } else {
+                    return Ok(None);
                 }
-                else {
-                    return Ok(None)
-                }
-            },
+            }
             None => (),
-        }
+        },
         None => (),
     }
     tracing::debug!("Saved key/cert not found, generating new");
@@ -73,17 +78,24 @@ async fn main() {
 
     // Application configuration
     let args = Args::parse();
-    let read_res = get_private_key_cert(
-        args.cert.clone(),
-        args.key.clone(),
-    );
+    let read_res = get_private_key_cert(args.cert.clone(), args.key.clone());
     let (cert, private_key) = match read_res {
         Ok(Some(key)) => key,
-        Ok(None) => {tracing::error!("Found no keys in {:?} or certs in {:?}", args.key, args.cert); return}
-        Err(e) => {tracing::error!("Couldn't open {:?} or {:?}: {:?}", args.key, args.cert, e); return},
+        Ok(None) => {
+            tracing::error!(
+                "Found no keys in {:?} or certs in {:?}",
+                args.key,
+                args.cert
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!("Couldn't open {:?} or {:?}: {:?}", args.key, args.cert, e);
+            return;
+        }
     };
     let listen_addr = SocketAddr::new("0.0.0.0".parse().unwrap(), args.port);
-    let config = peer::Config{
+    let config = peer::Config {
         ping_period: Duration::from_secs(args.period),
         hb_period: Duration::from_secs(1),
         hb_timeout: Duration::from_secs(3),
@@ -93,23 +105,17 @@ async fn main() {
     tracing::trace!("\tlisten_addr: {}", listen_addr);
     tracing::trace!("\tidentity: {}", auth::Identity::compute_u64(&cert.0[..]));
     tracing::trace!("\tpeer_config: {}", config);
-    let net = network::Network::new(
-        private_key, cert, listen_addr, config
-    );
+    let net = network::Network::new(private_key, cert, listen_addr, config);
 
     let res = match args.connect {
-        Some(remote_addr) => {
-            net.start_connect(remote_addr).await
-        },
-        None => {
-            net.start_listen().await
-        },
+        Some(remote_addr) => net.start_connect(remote_addr).await,
+        None => net.start_listen().await,
     };
     match res {
         Ok(_) => println!("Shutting down.."),
         Err(e) => {
             tracing::error!("Error running the peer: {}", e);
             println!("Error running the peer {}.\nShutting down..", e)
-        },
+        }
     }
 }
