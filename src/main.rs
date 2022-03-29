@@ -96,7 +96,7 @@ async fn main() {
     };
 
     tracing::info!("Launching peer");
-    tracing::trace!("\tlisten_addr: {}", listen_addr);
+    tracing::info!("\tlisten_addr: {}", listen_addr);
     tracing::trace!("\tidentity: {}", auth::Identity::compute_u64(&cert.0[..]));
     tracing::trace!("\tpeer_config: {}", config);
     let net = network::Network::new(private_key, cert, listen_addr, config);

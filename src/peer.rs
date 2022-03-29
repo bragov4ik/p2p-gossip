@@ -48,6 +48,7 @@ pub enum Error {
     // Channel understandable name
     ChannelClosed(String),
     Tls(rustls::Error),
+    IdentityMismatch,
 }
 
 #[derive(Debug)]
@@ -170,7 +171,7 @@ impl Peer {
 
     // Handle communication with a particular peer through a connection (if any)
     // tries to connect if no connection given
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip_all, level="trace")]
     pub async fn handle_peer(
         &mut self,
         mut conn_opt: Option<Connection<TlsStream<TcpStream>>>,
@@ -194,7 +195,7 @@ impl Peer {
                     return Err(Error::MutexPoisoned(MutexPoisoned {}));
                 }
                 if let Err(e) = conn.send_message(Message::ListPeersRequest).await {
-                    tracing::warn!("Couldn't send list peers request: {:?}", e);
+                    tracing::debug!("Couldn't send list peers request: {:?}", e);
                 }
             }
             // Skip to connection establishment if none
@@ -220,24 +221,16 @@ impl Peer {
                 };
                 if let Err(e) = res {
                     match &e {
-                        Error::Connection(conn_e) => match conn_e {
-                            connection::Error::Serialization(e) => tracing::warn!("{}", e),
-                            connection::Error::IO(e) => tracing::warn!("{}", e),
-                            connection::Error::StreamEnded => {
-                                tracing::error!("Connection closed");
-                                break;
-                            }
+                        Error::Connection(
+                            connection::Error::Serialization(_) | 
+                            connection::Error::IO(_)
+                        ) | Error::Tls(_) | Error::IdentityMismatch | Error::UnexpectedMessage(_) => 
+                            tracing::debug!("{:?}", e),
+                        Error::Connection(connection::Error::StreamEnded) => {
+                            tracing::debug!("Connection closed");
+                            break;
                         },
-                        Error::UnexpectedMessage(m) => {
-                            tracing::warn!("Received unexpected message {}, ignoring", m);
-                        }
-                        Error::Tls(e) => {
-                            tracing::warn!("Tls error: {}", e);
-                        }
-                        Error::MutexPoisoned(_) => {
-                            return Err(e);
-                        }
-                        Error::ChannelClosed(_) => {
+                        Error::MutexPoisoned(_) | Error::ChannelClosed(_) => {
                             return Err(e);
                         }
                     }
@@ -264,7 +257,7 @@ impl Peer {
                         break;
                     }
                     Err(Error::MutexPoisoned(_)) => return Err(res.unwrap_err()),
-                    Err(e) => tracing::warn!("Error while reconnecting; trying again: {:?}", e),
+                    Err(e) => tracing::debug!("Error while reconnecting; trying again: {:?}", e),
                 }
             }
         }
@@ -274,7 +267,7 @@ impl Peer {
     /// 
     /// Tries to connect by itself to a known address or receives
     /// new connectinos from `network` module that was initiated by the peer.
-    #[tracing::instrument(skip(new_connections))]
+    #[tracing::instrument(skip(self_auth, self_private_key, self_cert, new_connections))]
     async fn reconnect(
         peer_info: Info,
         peer_id: Arc<Identity>,
@@ -289,7 +282,7 @@ impl Peer {
 
             // We either reconnect by ourselves or receive new connection from the Network
             // (the peer connected through the listen port)
-            let res = tokio::select! {
+            let err = tokio::select! {
                 connect_res = TcpStream::connect(peer_listen_addr) => {
                     match connect_res {
                         Ok(stream) => {
@@ -308,17 +301,18 @@ impl Peer {
                                         return Ok((conn, peer_listen_addr))
                                     }
                                     else {
-                                        tracing::info!("Peer's identity didn't match");
-                                        continue;
+                                        tracing::debug!("Peer's identity didn't match");
+                                        Error::IdentityMismatch
                                     }
                                 },
-                                Err(e) =>
-                                    tracing::warn!("Error while authenticating: {:?}", e),
-                            };
-                            Ok(())
+                                Err(e) => {
+                                    tracing::debug!("Error while authenticating: {:?}", e);
+                                    e
+                                },
+                            }
                         },
                         Err(e) => {
-                            Err(Error::Connection(connection::Error::IO(e)))
+                            Error::Connection(connection::Error::IO(e))
                         },
                     }
                 },
@@ -337,15 +331,12 @@ impl Peer {
                     }
                 }
             };
-            if let Err(e) = res {
-                tracing::warn!(
-                    "Error while reconnecting to {:?}: {:?}",
-                    peer_listen_addr,
-                    e
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+            tracing::debug!(
+                "Error while reconnecting to {:?}: {:?}",
+                peer_listen_addr,
+                err
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -390,6 +381,7 @@ impl Peer {
     /// and compare the identity with known (if given).
     /// 
     /// Client auth is used when initiating the connection.
+    #[tracing::instrument(skip_all, level = "debug")]
     async fn auth_client(
         self_auth: Arc<Identity>,
         peer_auth: Option<Arc<Identity>>,
@@ -426,6 +418,7 @@ impl Peer {
     /// Exchange identity information, verify that it is consistent with received public key.
     /// 
     /// Server auth is used when receiving the connection.
+    #[tracing::instrument(skip_all, level = "debug")]
     pub async fn auth_server(
         self_auth: Arc<Identity>,
         self_listen_port: u16,

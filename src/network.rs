@@ -173,7 +173,7 @@ impl Network {
                     ).await;
                     match handle_new_con_res {
                         Err(Error::Peer(peer::Error::Connection(_) | peer::Error::Tls(_) |
-                        peer::Error::UnexpectedMessage(_))) => tracing::warn!("{:?}", handle_new_con_res),
+                        peer::Error::UnexpectedMessage(_))) => tracing::debug!("{:?}", handle_new_con_res),
                         Err(Error::Peer(peer::Error::MutexPoisoned(_))) => {
                             tracing::error!("Some mutex was poisoned, unable to continue");
                             return Ok(())
@@ -183,7 +183,7 @@ impl Network {
                                 peer can't be handled without it", s);
                             return Ok(())
                         }
-                        Err(_) => tracing::warn!("{:?}", handle_new_con_res),
+                        Err(_) => tracing::debug!("{:?}", handle_new_con_res),
                         Ok(_) => (),
                     }
                 }
@@ -194,7 +194,7 @@ impl Network {
                             if let Err(e) = self.add_to_network(
                                 peer_id, peer_listen_addr, self.peer_config.clone(), None
                             ).await {
-                                tracing::warn!("Error adding peer by auth info: {:?}", e);
+                                tracing::debug!("Error adding peer by auth info: {:?}", e);
                             }
                         },
                         None => tracing::error!("New auth was closed unexpectedly, can't work properly"),
