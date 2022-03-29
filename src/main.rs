@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::time::Duration;
 
-use crate::utils::gen_private_key_cert;
+use crate::utils::gen_cert_private_key;
 
 mod auth;
 mod connection;
@@ -62,7 +62,7 @@ fn get_private_key_cert(
         }
     }
     tracing::debug!("Saved key/cert not found, generating new");
-    Ok(Some(gen_private_key_cert()))
+    Ok(Some(gen_cert_private_key()))
 }
 
 #[tokio::main]

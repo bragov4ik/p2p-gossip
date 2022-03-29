@@ -4,7 +4,7 @@ use tracing::Level;
 #[derive(Debug)]
 pub struct MutexPoisoned {}
 
-pub fn gen_private_key_cert() -> (Certificate, PrivateKey) {
+pub fn gen_cert_private_key() -> (Certificate, PrivateKey) {
     let gen = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert = Certificate(gen.serialize_der().unwrap());
     let key = PrivateKey(gen.serialize_private_key_der());

@@ -44,5 +44,5 @@ If a node losses connection to the peer (either by closing TCP connection or abs
 
 *picture of network split*
 
-<!-- ## Possible further improvements
-* sadsad -->
+## Possible further improvements
+* Store known peers in persistent storage to reconnect after shutting application down

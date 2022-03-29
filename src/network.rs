@@ -144,12 +144,20 @@ impl Network {
         }
     }
 
+    /// Start the node without initially connecting to anyone.
+    /// 
+    /// Waits for incoming connection on specified port.
+    /// If new peer connects, adds it to list of known peers and creates
+    /// a handle for it.
+    /// If existing peer connects, forwards the connection to the existing
+    /// handle.
     pub async fn start_listen(mut self) -> std::io::Result<()> {
         tracing::debug!("Starting to listen on addr {:?}", self.listen_bind);
         let listener = TcpListener::bind(self.listen_bind).await?;
         loop {
             tokio::select! {
                 listen_res = listener.accept() => {
+                    // New connection from listener
                     let stream = match listen_res {
                         Ok((stream, _addr)) => {
                             stream
@@ -180,6 +188,7 @@ impl Network {
                     }
                 }
                 auth_opt = self.new_auth_addr_receiver.recv() => {
+                    // Discovered new peers from other's known peers lists
                     match auth_opt {
                         Some((peer_id, peer_listen_addr)) => {
                             if let Err(e) = self.add_to_network(
@@ -192,6 +201,7 @@ impl Network {
                     }
                 }
                 peer_opt = self.new_peers_receiver.recv() => {
+                    // Peer handle is scheduled for run
                     match peer_opt {
                         Some((mut peer, conn)) => {
                             let self_private_key = self.self_private_key.clone();
@@ -211,6 +221,9 @@ impl Network {
         }
     }
 
+    /// Start the node with joining a network through peer at `connect_addr`.
+    /// 
+    /// After joining operates normally as in `start_listen`
     pub async fn start_connect(mut self, connect_addr: SocketAddr) -> std::io::Result<()> {
         tracing::trace!("Connecting to {}...", connect_addr);
         let init_connection = TcpStream::connect(connect_addr).await?;
@@ -228,6 +241,9 @@ impl Network {
         Ok(())
     }
 
+    /// Handles new connection.
+    /// 
+    /// Authenticates the peer and adds it to the network on success.
     #[tracing::instrument(skip_all, fields(peer_addr=?stream.peer_addr().map(|a| a.to_string())))]
     async fn handle_new_con(
         &mut self,
@@ -240,6 +256,9 @@ impl Network {
             .map_err(connection::Error::IO)
             .map_err(peer::Error::Connection)
             .map_err(Error::Peer)?;
+        // We distinguish between incoming/outcoming since rustls has a concept of
+        // server and client. Initiator of the connection is considered as client
+        // and acceptor is a server.
         let (peer_id, peer_listen_port, conn) = match incoming {
             true => peer::Peer::auth_server(
                 self.self_id.clone(),
@@ -266,8 +285,11 @@ impl Network {
         Ok(())
     }
 
-    /// Based on the identity either send Peer the connection or add a new peer handler
-    /// peer_addr - address at which peer's listener's at
+    /// Add the peer to network
+    /// 
+    /// Has two use cases:
+    /// * *Known peer* Sending new connection to existing peer handler
+    /// * *New peer* Create new handler with connection (if provided) and schedule it for execution
     #[tracing::instrument(skip(self, peer_listen_addr, peer_config, conn_opt), fields(peer_listen_addr=%peer_listen_addr))]
     async fn add_to_network(
         &mut self,
@@ -300,7 +322,7 @@ impl Network {
                     .expect("Key disappeared right after checking for contains_key, very strange");
                 notifier.notify_new_connection(conn).await?;
             } else {
-                tracing::debug!("No connection was provieded, ignoring");
+                tracing::debug!("No connection was provided, ignoring");
             }
         } else {
             tracing::debug!("Peer is unknown, creating a new handler");
@@ -332,6 +354,7 @@ impl Network {
         Ok(())
     }
 
+    /// Put information about given peer into `peers_info` storage
     #[tracing::instrument(skip(self, peer_listen_addr), fields(peer_listen_addr=%peer_listen_addr))]
     fn insert_info(
         &mut self,
@@ -345,3 +368,4 @@ impl Network {
         Ok(info_map.insert(peer_identity, new_info))
     }
 }
+

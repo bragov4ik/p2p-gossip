@@ -91,3 +91,53 @@ impl rustls::server::ClientCertVerifier for PeerVerifier {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rustls::{client::ServerCertVerifier, Certificate, server::ClientCertVerifier};
+
+    use crate::utils::gen_cert_private_key;
+
+    use super::*;
+
+    #[test]
+    fn test_identity() {
+        let (cert1, _) = gen_cert_private_key();
+        let (cert2, _) = gen_cert_private_key();
+        let id = Identity::new(&cert1.0);
+        assert!(id.compare_key(&cert1.0));
+        assert!(!id.compare_key(&cert2.0));
+        assert_ne!(Identity::compute_u64(&cert1.0), Identity::compute_u64(&cert2.0));
+    }
+
+    fn test_verify_server(verifier: Arc<PeerVerifier>, cert: Certificate) -> bool {
+        verifier.verify_server_cert(
+            &cert,
+            &vec![],
+            &"example.com".try_into().unwrap(),
+            &mut (&[]).iter().copied(),
+            &vec![],
+            std::time::SystemTime::now()
+        ).is_ok()
+    }
+
+    fn test_verify_client(verifier: Arc<PeerVerifier>, cert: Certificate) -> bool {
+        verifier.verify_client_cert(
+            &cert,
+            &vec![],
+            std::time::SystemTime::now(),
+        ).is_ok()
+    }
+
+    #[test]
+    fn test_verifier() {
+        let (cert1, _) = gen_cert_private_key();
+        let (cert2, _) = gen_cert_private_key();
+        let id = Identity::new(&cert1.0);
+        let verifier = PeerVerifier::new((*id).clone());
+        assert!(test_verify_server(verifier.clone(), cert1.clone()));
+        assert!(!test_verify_server(verifier.clone(), cert2.clone()));
+        assert!(test_verify_client(verifier.clone(), cert1));
+        assert!(!test_verify_client(verifier.clone(), cert2));
+    }
+}

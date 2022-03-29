@@ -1,7 +1,6 @@
 use rustls::{Certificate, PrivateKey};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
     fmt::Display,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -271,6 +270,10 @@ impl Peer {
         }
     }
 
+    /// Reconnect to the peer.
+    /// 
+    /// Tries to connect by itself to a known address or receives
+    /// new connectinos from `network` module that was initiated by the peer.
     #[tracing::instrument(skip(new_connections))]
     async fn reconnect(
         peer_info: Info,
@@ -346,6 +349,9 @@ impl Peer {
         }
     }
 
+    /// Perform authentication of new peer
+    /// 
+    /// Does not compare with existing ID.
     pub async fn auth_new_client(
         self_auth: Arc<Identity>,
         self_listen_port: u16,
@@ -356,6 +362,9 @@ impl Peer {
         Self::auth_client(self_auth, None, self_listen_port, stream, private_key, cert).await
     }
 
+    /// Perform authentication of existing peer
+    /// 
+    /// Compares received ID with known.
     pub async fn auth_existing_client(
         self_auth: Arc<Identity>,
         peer_auth: Arc<Identity>,
@@ -375,6 +384,12 @@ impl Peer {
         .await
     }
 
+    /// Authenticate the peer.
+    /// 
+    /// Exchange identity information, verify that it is consistent with received public key,
+    /// and compare the identity with known (if given).
+    /// 
+    /// Client auth is used when initiating the connection.
     async fn auth_client(
         self_auth: Arc<Identity>,
         peer_auth: Option<Arc<Identity>>,
@@ -406,6 +421,11 @@ impl Peer {
         Ok((peer_auth, peer_listen_port, conn))
     }
 
+    /// Authenticate the peer.
+    /// 
+    /// Exchange identity information, verify that it is consistent with received public key.
+    /// 
+    /// Server auth is used when receiving the connection.
     pub async fn auth_server(
         self_auth: Arc<Identity>,
         self_listen_port: u16,
@@ -431,6 +451,7 @@ impl Peer {
         Ok((peer_id, peer_listen_port, conn))
     }
 
+    /// Exchange pairing information (identity + listen port)
     #[tracing::instrument(skip(stream))]
     async fn exchange_pair(
         self_auth: Arc<Identity>,
@@ -522,6 +543,7 @@ impl Peer {
         Ok(())
     }
 
+    /// Check last active time of the peer and update its status accordingly
     #[tracing::instrument(skip_all)]
     async fn check_heartbeat(
         &mut self,
@@ -548,6 +570,9 @@ impl Peer {
         Ok(())
     }
 
+    /// List all known peers with their listening addresses
+    /// 
+    /// Main purpose is not to hold mutex across awaits
     fn list_peers(&self) -> Result<Vec<(Identity, SocketAddr)>, MutexPoisoned> {
         let peers_info = self.peers_info.lock().map_err(|_| MutexPoisoned {})?;
 
@@ -563,33 +588,45 @@ impl Peer {
             .collect::<Result<Vec<(Identity, SocketAddr)>, MutexPoisoned>>()
     }
 
+    /// Get set of known peers (to check if any new are found)
+    /// 
+    /// Main purpose is not to hold mutex across awaits
     fn known_peers(&self) -> Result<std::collections::HashSet<Identity>, MutexPoisoned> {
         let peers_info = self.peers_info.lock().map_err(|_| MutexPoisoned {})?;
 
         Ok(peers_info.keys().map(|k| (**k).clone()).collect())
     }
 
-    // was made to isolate lock and not hold it across awaits
+
+    /// Get copy of handled peer's info
+    /// 
+    /// Main purpose is not to hold mutex across awaits
     fn get_info_copy(&self) -> Result<Info, MutexPoisoned> {
         let info = self.peer_info.lock().map_err(|_| MutexPoisoned {})?;
         Ok(info.clone())
     }
 
-    // same, lock isolation to avoid deadlock
+    /// Update peer's status
+    /// 
+    /// Main purpose is not to hold mutex across awaits
     fn update_status(&self, new_status: Status) -> Result<(), MutexPoisoned> {
         let mut info = self.peer_info.lock().map_err(|_| MutexPoisoned {})?;
         info.status = new_status;
         Ok(())
     }
 
-    // same, lock isolation to avoid deadlock
+    /// Update peer's listen address
+    /// 
+    /// Main purpose is not to hold mutex across awaits
     fn update_listen_addr(&self, addr: SocketAddr) -> Result<(), MutexPoisoned> {
         let mut info = self.peer_info.lock().map_err(|_| MutexPoisoned {})?;
         info.last_address = addr;
         Ok(())
     }
 
-    // same
+    /// Get peer's listen address
+    /// 
+    /// Main purpose is not to hold mutex across awaits
     fn get_listen_addr(&self) -> Result<SocketAddr, MutexPoisoned> {
         let info = self.peer_info.lock().map_err(|_| MutexPoisoned {})?;
         Ok(info.last_address)
@@ -598,7 +635,9 @@ impl Peer {
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::{gen_private_key_cert, init_debugging};
+    use std::collections::HashMap;
+
+    use crate::utils::{gen_cert_private_key, init_debugging};
     use tokio::net::TcpListener;
     use tracing::Level;
 
@@ -748,8 +787,8 @@ mod tests {
         let peers_info = init_testing();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
-        let (peer1_cert, peer1_key) = gen_private_key_cert();
-        let (peer2_cert, peer2_key) = gen_private_key_cert();
+        let (peer1_cert, peer1_key) = gen_cert_private_key();
+        let (peer2_cert, peer2_key) = gen_cert_private_key();
         let peer1_id = Identity::new(&peer1_cert.0[..]);
         let peer2_id = Identity::new(&peer2_cert.0[..]);
         let peer1_test = connect_test_peer(
