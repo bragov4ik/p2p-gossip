@@ -39,7 +39,7 @@ Workload on joining the network lies on the new node. The process is the followi
 ### Authentication and (some) security
 Nodes have identity that consist of their hashed public keys. When a node joins the network, peers simply add its identity to their known peers list. On the following reconnections to the network, the peers receive the same identity and match it to given public key, authenticating the node this way (in fact, the node also verifies other peers the same way).
 
-*pic of authentication and identity comparison*
+![Auth](https://user-images.githubusercontent.com/8144358/160614192-1371ee44-a3ea-4fc2-ad6f-f78678d47bde.png)
 
 The traffic is encrypted using TLS with certificate verification procedure described above, i.e. known peers' public keys are compared with their identities and new peers are simply accepted and rememebered.
 ### Status check
@@ -47,8 +47,7 @@ Network uses heartbeat messages for checking status of other nodes. If a node do
 ### Connection loss
 If a node losses connection to the peer (either by closing TCP connection or absence of heartbeat) it starts reconnection procedure. On reconnection, the peers authenticate each other and exchange lists of known peers. It is done for the case of network splitting, when new nodes are added to both sides.
 
-
-*picture of network split*
+![Reconnect network split](https://user-images.githubusercontent.com/8144358/160614244-346eae04-ebe0-4d59-a1f5-ee3d9a5e16d5.png)
 
 ## Possible further improvements
 * Store known peers in persistent storage to reconnect after shutting application down
