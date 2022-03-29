@@ -95,13 +95,15 @@ impl rustls::server::ClientCertVerifier for PeerVerifier {
 #[cfg(test)]
 mod tests {
     use rustls::{client::ServerCertVerifier, Certificate, server::ClientCertVerifier};
+    use tracing::Level;
 
-    use crate::utils::gen_cert_private_key;
+    use crate::utils::{gen_cert_private_key, init_debugging};
 
     use super::*;
 
     #[test]
     fn test_identity() {
+        init_debugging(Level::ERROR);
         let (cert1, _) = gen_cert_private_key();
         let (cert2, _) = gen_cert_private_key();
         let id = Identity::new(&cert1.0);
@@ -131,6 +133,7 @@ mod tests {
 
     #[test]
     fn test_verifier() {
+        init_debugging(Level::ERROR);
         let (cert1, _) = gen_cert_private_key();
         let (cert2, _) = gen_cert_private_key();
         let id = Identity::new(&cert1.0);

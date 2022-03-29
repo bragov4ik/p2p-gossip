@@ -158,7 +158,7 @@ mod tests {
     // Simple test
     #[test]
     fn transfer_different_types() {
-        init_debugging(Level::INFO);
+        init_debugging(Level::ERROR);
 
         info!("Running tests");
         let results = vec![
@@ -196,7 +196,7 @@ mod tests {
     // Test buffering
     #[tokio::test]
     async fn transfer_multiple_messages() {
-        init_debugging(Level::INFO);
+        init_debugging(Level::ERROR);
 
         info!("Running tests");
         let tests = [

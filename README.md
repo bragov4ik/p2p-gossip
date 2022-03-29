@@ -26,6 +26,16 @@ This will start a node that will ping others each 3 seconds, accept connections 
 This is a fully-connected network, which means all nodes directly communicate to each other. This allows to simplify ping distribution process, since each peer is responsible only for itself.
 
 ### Joining
+Workload on joining the network lies on the new node. The process is the following:
+1. Communication with the first peer
+   1. The node connects to some peer in the network
+   2. They exchange their information and add each other to known peers list
+   3. The node asks for list of peers and gets a result
+2. Communication with the remaining peers
+   1. The node connects to all other nodes from the list
+   2. They exchange info, add themselves to their lists
+   3. If any other nodes found, repeat from 2.1
+
 ### Authentication and (some) security
 Nodes have identity that consist of their hashed public keys. When a node joins the network, peers simply add its identity to their known peers list. On the following reconnections to the network, the peers receive the same identity and match it to given public key, authenticating the node this way (in fact, the node also verifies other peers the same way).
 
@@ -34,15 +44,12 @@ Nodes have identity that consist of their hashed public keys. When a node joins 
 The traffic is encrypted using TLS with certificate verification procedure described above, i.e. known peers' public keys are compared with their identities and new peers are simply accepted and rememebered.
 ### Status check
 Network uses heartbeat messages for checking status of other nodes. If a node doesn't receive a heartbeat from another for some time, it considers the peer dead. 
-
-*pic of heartbeat*
-
 ### Connection loss
 If a node losses connection to the peer (either by closing TCP connection or absence of heartbeat) it starts reconnection procedure. On reconnection, the peers authenticate each other and exchange lists of known peers. It is done for the case of network splitting, when new nodes are added to both sides.
 
-*pic of simple reconnecition*
 
 *picture of network split*
 
 ## Possible further improvements
 * Store known peers in persistent storage to reconnect after shutting application down
+* Maybe better authentication

@@ -306,7 +306,7 @@ impl Network {
         if self.notifiers.contains_key(&peer_id) {
             tracing::debug!("Peer is already known");
             if let Some(conn) = conn_opt {
-                match self.insert_info(peer_id.clone(), peer_listen_addr) {
+                match Self::insert_info(self.peers_info.clone(), peer_id.clone(), peer_listen_addr) {
                     Ok(Some(_)) => tracing::warn!(
                         "Inconsistency between `notifiers` and `peers_info`\
                         which probably happened from some previous error, this may lead to wrong \
@@ -326,7 +326,7 @@ impl Network {
             }
         } else {
             tracing::debug!("Peer is unknown, creating a new handler");
-            match self.insert_info(peer_id.clone(), peer_listen_addr) {
+            match Self::insert_info(self.peers_info.clone(), peer_id.clone(), peer_listen_addr) {
                 Ok(Some(_)) => tracing::warn!(
                     "Inconsistency between `notifiers` and `peers_info`\
                     which probably happened from some previous error, this may lead to wrong \
@@ -354,18 +354,64 @@ impl Network {
         Ok(())
     }
 
-    /// Put information about given peer into `peers_info` storage
-    #[tracing::instrument(skip(self, peer_listen_addr), fields(peer_listen_addr=%peer_listen_addr))]
+    /// Put information about given peer into `peers_info` storage and
+    /// return previous value
+    #[tracing::instrument(skip(peers_info, peer_listen_addr), fields(peer_listen_addr=%peer_listen_addr))]
     fn insert_info(
-        &mut self,
+        peers_info: Arc<Mutex<PeerInfoMap>>,
         peer_identity: Arc<Identity>,
         peer_listen_addr: SocketAddr,
     ) -> Result<Option<Arc<Mutex<Info>>>, MutexPoisoned> {
         tracing::debug!("Updating listen address");
-        let mut info_map = self.peers_info.lock().map_err(|_| MutexPoisoned {})?;
+        let mut info_map = peers_info.lock().map_err(|_| MutexPoisoned {})?;
         let new_info = Arc::new(Mutex::new(Info::new(peer_listen_addr)));
         tracing::debug!("Updated successfully");
         Ok(info_map.insert(peer_identity, new_info))
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tracing::Level;
+
+    use crate::utils::{gen_cert_private_key, init_debugging};
+
+    use super::*;
+
+    #[test]
+    fn test_insert_info() {
+        init_debugging(Level::ERROR);
+        let peers_info = Arc::new(Mutex::new(HashMap::new()));
+        let id = Identity::new(b"1");
+        let addr = "1.2.3.4:5".parse().unwrap();
+        let a = Network::insert_info(
+            peers_info.clone(), id.clone(), addr
+        ).unwrap();
+        assert!(a.is_none());
+        let map = peers_info.lock().unwrap();
+        let info_got = map.get(&id).unwrap();
+        assert!(info_got.lock().unwrap().last_address == addr);
+    }
+
+    #[tokio::test]
+    async fn test_network_runs() {
+        init_debugging(Level::ERROR);
+        let (cert, key) = gen_cert_private_key();
+        let listen_addr = "127.0.0.1:0".parse().unwrap();
+        let config = peer::Config {
+            ping_period: Duration::from_secs(5),
+            hb_period: Duration::from_secs(1),
+            hb_timeout: Duration::from_secs(3),
+        };
+        let net = Network::new(key, cert, listen_addr, config);
+
+        assert!(tokio::time::timeout(
+            Duration::from_secs(3),
+            net.start_listen(),
+        )
+        .await
+        .is_err());
+    }
+}
