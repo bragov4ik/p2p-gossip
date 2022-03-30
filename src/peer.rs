@@ -15,7 +15,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use crate::{
     auth::{self, Identity},
     connection::{self},
-    utils::MutexPoisoned, network::PeerInfoMap,
+    utils::{MutexPoisoned, gen_random_message}, network::PeerInfoMap,
 };
 use connection::Connection;
 
@@ -59,7 +59,7 @@ pub enum CreationError {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Message {
-    Ping,
+    Gossip(String),
     Heartbeat,
     ListPeersRequest,
     ListPeersResponse(Vec<(Identity, SocketAddr)>),
@@ -70,7 +70,7 @@ pub enum Message {
 impl Display for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Message::Ping => write!(f, "Ping"),
+            Message::Gossip(s) => s.fmt(f),
             Message::Heartbeat => write!(f, "Heartbeat"),
             Message::ListPeersRequest => write!(f, "ListPeersRequest"),
             Message::ListPeersResponse(map) => write!(f, "ListPeersResponse {:?}", map),
@@ -171,7 +171,7 @@ impl Peer {
 
     // Handle communication with a particular peer through a connection (if any)
     // tries to connect if no connection given
-    #[tracing::instrument(skip_all, level="trace")]
+    #[tracing::instrument(skip_all)]
     pub async fn handle_peer(
         &mut self,
         mut conn_opt: Option<Connection<TlsStream<TcpStream>>>,
@@ -189,6 +189,7 @@ impl Peer {
             if let Some(conn) = &mut conn_opt {
                 tracing::debug!("Asking for list of peers after reconnect, if any");
                 if let Ok(peer_listen_addr) = self.get_listen_addr() {
+                    println!("Connected to {}/{}", self.peer_id, peer_listen_addr);
                     tracing::info!("Connected to {}/{}", self.peer_id, peer_listen_addr);
                 } else {
                     tracing::error!("Mutex peer_info poisoned, unable to proceed");
@@ -208,7 +209,7 @@ impl Peer {
                         }
                     }
                     _ = ping_interval.tick() => {
-                        conn.send_message(Message::Ping).await
+                        conn.send_message(Message::Gossip(gen_random_message())).await
                             .map_err(Error::Connection)
                     }
                     _ = hb_send_interval.tick() => {
@@ -250,6 +251,7 @@ impl Peer {
                 .await;
                 match res {
                     Ok((conn, new_listen)) => {
+                        println!("Connected to {}/{}", self.peer_id, new_listen);
                         tracing::debug!("(Re)connected to {}/{}", self.peer_id, new_listen);
                         conn_opt = Some(conn);
                         self.update_listen_addr(new_listen)
@@ -494,9 +496,10 @@ impl Peer {
     ) -> Result<(), Error> {
         tracing::debug!("Received (from {}): {:?}", *self.peer_id, m);
         match m {
-            Message::Ping => {
+            Message::Gossip(s) => {
                 let info = self.get_info_copy().map_err(Error::MutexPoisoned)?;
-                tracing::info!("{}/{} - {}", self.peer_id, info.last_address, m);
+                println!("Received message {} from {}/{}", s, self.peer_id, info.last_address);
+                tracing::info!("{}/{} - {}", self.peer_id, info.last_address, s);
             }
             Message::Heartbeat => (), // We update timer on each activity after match
             Message::ListPeersRequest => {

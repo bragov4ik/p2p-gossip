@@ -95,6 +95,7 @@ async fn main() {
         hb_timeout: Duration::from_secs(3),
     };
 
+    println!("Launching peer, listening on {}", listen_addr);
     tracing::info!("Launching peer");
     tracing::info!("\tlisten_addr: {}", listen_addr);
     tracing::trace!("\tidentity: {}", auth::Identity::compute_u64(&cert.0[..]));

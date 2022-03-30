@@ -1,3 +1,4 @@
+use rand::{distributions::Alphanumeric, Rng};
 use rustls::{Certificate, PrivateKey};
 use tracing::Level;
 
@@ -9,6 +10,15 @@ pub fn gen_cert_private_key() -> (Certificate, PrivateKey) {
     let cert = Certificate(gen.serialize_der().unwrap());
     let key = PrivateKey(gen.serialize_private_key_der());
     (cert, key)
+}
+
+pub fn gen_random_message() -> String {
+    let str = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(10)
+        .map(char::from)
+        .collect();
+    str   
 }
 
 #[allow(dead_code)]

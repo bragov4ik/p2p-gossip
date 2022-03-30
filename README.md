@@ -14,7 +14,7 @@ It starts a node that will ping others each 5 seconds and listen for new connect
 `p2p-gossip --period 3 --port 8081 --connect 127.0.0.1:8080`
 This will start a node that will ping others each 3 seconds, accept connections on port 8081, and will try to join the network through the node at `127.0.0.1:8080` at the startup.
 
-Logging levels are controlled by env variable `RUST_LOG`
+Logging levels are controlled by env variable `RUST_LOG`. You might want to set it to `RUST_LOG=off` if you don't want to get read any logs (for demo for example).
 
 ### Arguments description
 * `--period` (optional) time between ping messages sent to other peers. Default is 5.

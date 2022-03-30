@@ -165,7 +165,7 @@ mod tests {
             run_one(1, 2),
             run_one("aboba".to_owned(), "abeba".to_owned()),
             run_one((1, "a".to_owned()), (2, "b".to_owned())),
-            run_one(Message::Ping, Message::Heartbeat),
+            run_one(Message::Gossip("a".to_string()), Message::Heartbeat),
             run_one(
                 Message::ListPeersRequest,
                 Message::ListPeersResponse(vec![
